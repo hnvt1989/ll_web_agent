@@ -1,6 +1,6 @@
 # TODO Checklist
 
-- [] **0 — Project Foundation**
+- [X] **0 — Project Foundation**
     - [ ] 0.1 Bootstrap monorepo
         - [ ] Create root package.json with workspaces
         - [ ] Scaffold backend/package.json
@@ -20,11 +20,11 @@
         - [ ] Add workflow for lint/build/test
         - [ ] Verify CI passes on main branch
 
-- [] **1 — MCP Connectivity Layer**
-    - [ ] 1.1 Define MCP types
+- [X] **1 — MCP Connectivity Layer**
+    - [ X] 1.1 Define MCP types
         - [ ] Create backend/src/types/mcp.ts interfaces
         - [ ] Add npm script `typecheck`
-    - [ ] 1.2 WebSocket wrapper
+    - [ X] 1.2 WebSocket wrapper
         - [ ] Install `ws` library
         - [ ] Implement McpSocket class skeleton
         - [ ] Add heartbeat ping every 15 s
