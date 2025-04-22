@@ -1,6 +1,6 @@
 # TODO Checklist
 
-- [X] **0 — Project Foundation**
+- [] **0 — Project Foundation**
     - [ ] 0.1 Bootstrap monorepo
         - [ ] Create root package.json with workspaces
         - [ ] Scaffold backend/package.json
@@ -20,7 +20,7 @@
         - [ ] Add workflow for lint/build/test
         - [ ] Verify CI passes on main branch
 
-- [X] **1 — MCP Connectivity Layer**
+- [] **1 — MCP Connectivity Layer**
     - [ ] 1.1 Define MCP types
         - [ ] Create backend/src/types/mcp.ts interfaces
         - [ ] Add npm script `typecheck`
