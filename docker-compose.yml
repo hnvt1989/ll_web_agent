@@ -6,7 +6,7 @@ networks:
 
 services:
   playwright-mcp:
-    image: mcr.microsoft.com/playwright/python:v1.42.0-jammy # Use an official Playwright image
+    image: mcr.microsoft.com/playwright:v1.42.0-jammy # Use the standard Playwright image with Node.js
     container_name: mcp-server # Explicit hostname for backend connection
     command: npx playwright-mcp start --port 9000 --host 0.0.0.0 # Listen on all interfaces within the container
     networks:
@@ -23,6 +23,8 @@ services:
     environment:
       # Backend connects to MCP server via its container name on the Docker network
       - MCP_SERVER_WS=ws://mcp-server:9000
+      # Pass the OpenAI API Key from the .env file
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
       # Add any other necessary backend environment variables here
       # - NODE_ENV=development
     networks:
@@ -38,9 +40,8 @@ services:
     ports:
       - "5173:5173" # Expose UI port to host (as requested)
     environment:
-      # If UI needs to talk to backend, use backend container name
-      # Example for Vite React App:
-      - VITE_BACKEND_URL=http://backend-service:3000
+      # Set the base URL for the browser to access the backend API
+      - VITE_API_BASE_URL=http://localhost:3000
       # Add any other necessary UI environment variables here
       # - NODE_ENV=development
     networks:

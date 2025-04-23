@@ -1,5 +1,9 @@
 import React, { useState } from 'react';
 
+// Get the API base URL from environment variables
+// Default to localhost:3000 if not set
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000';
+
 interface InstructionInputProps {
   // Optional callback for when parsing is successful
   onParseSuccess?: (parsedSteps: any) => void; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -28,7 +32,10 @@ function InstructionInput({ onParseSuccess, onParseError }: InstructionInputProp
     setError(null);
 
     try {
-      const response = await fetch('/api/parse', {
+      // Use the environment variable for the fetch URL
+      const apiUrl = `${API_BASE_URL}/api/parse`;
+      console.log('[InstructionInput.tsx] Fetching:', apiUrl); // <-- Log the URL
+      const response = await fetch(apiUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

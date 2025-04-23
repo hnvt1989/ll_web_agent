@@ -135,80 +135,86 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
             stream: true,
         });
 
-        // Temporary storage for assembling tool call arguments
-        const toolCallChunks: { [id: string]: { name: string; arguments: string } } = {};
+        // Refactored: Temporary storage based on index
+        const intermediateChunks: { [index: number]: { id?: string; name?: string; arguments: string } } = {};
 
+        console.log('[parseInstruction] Starting stream processing...');
+        console.log('[parseInstruction] Entering for await loop...');
         for await (const chunk of stream) {
             const delta = chunk.choices[0]?.delta;
 
             if (delta?.tool_calls) {
                 for (const toolCallDelta of delta.tool_calls) {
-                    const id = toolCallDelta.id; // ID is consistent across chunks for the same call
-                    // index might be useful for ordering if needed: const index = toolCallDelta.index;
+                    const index = toolCallDelta.index;
+                    // Log details specifically about the tool call delta
+                    console.log(`[parseInstruction] Received tool_call delta for Index: ${index}`, JSON.stringify(toolCallDelta));
 
-                    if (id && toolCallDelta.function) {
-                         if (!toolCallChunks[id]) {
-                            // Initialize entry for this tool call ID
-                            toolCallChunks[id] = { name: toolCallDelta.function.name || '', arguments: '' };
-                        }
-                        if (toolCallDelta.function.arguments) {
-                            // Append argument chunks
-                            toolCallChunks[id].arguments += toolCallDelta.function.arguments;
-                        }
-                         // Update name if it arrives in a later chunk (though typically in the first)
-                        if (toolCallDelta.function.name && !toolCallChunks[id].name) {
-                           toolCallChunks[id].name = toolCallDelta.function.name;
-                        }
+                    if (index !== undefined) {
+                         // Ensure entry exists for this index
+                         if (!intermediateChunks[index]) {
+                             intermediateChunks[index] = { arguments: '' };
+                         }
+
+                         // Update fields if present in the delta
+                         if (toolCallDelta.id) {
+                             intermediateChunks[index].id = toolCallDelta.id;
+                         }
+                         if (toolCallDelta.function?.name) {
+                             intermediateChunks[index].name = toolCallDelta.function.name;
+                         }
+                         if (toolCallDelta.function?.arguments) {
+                             intermediateChunks[index].arguments += toolCallDelta.function.arguments;
+                         }
                     }
                 }
             }
         }
+        console.log('[parseInstruction] Finished stream processing.');
+        console.log('[parseInstruction] Assembled Intermediate Chunks (by index):', JSON.stringify(intermediateChunks));
 
-        // Process the assembled chunks
-        // Define an intermediate type that includes null possibility from map
+        // Process the assembled intermediate chunks
         type PotentialToolCall = McpToolCall | null;
 
-        const parsedToolCalls: McpToolCall[] = Object.entries(toolCallChunks)
-            .sort(([, a], [, b]) => {
-                // Attempt to maintain order if index was somehow available and stored, otherwise fallback
-                // A robust solution might involve storing the index from the delta if present
-                return 0; // Simple sort, assuming order is generally preserved or handled later
-            })
-            .map(([id, callInfo]): PotentialToolCall => { // Map returns PotentialToolCall
+        const parsedToolCalls: McpToolCall[] = Object.values(intermediateChunks) // Process values (assembled calls)
+             // Ensure sorting by index if needed, though Object.values might preserve insertion order for numeric keys
+             // .sort((a, b) => /* compare based on original index if stored */) 
+            .map((callInfo, index): PotentialToolCall => { // Map returns PotentialToolCall
+                const id = callInfo.id;
+                const name = callInfo.name;
+                const argsString = callInfo.arguments;
+                console.log(`[parseInstruction] Processing assembled chunk for Index ${index} (ID ${id}):`, JSON.stringify(callInfo));
+
                 try {
-                    // Ensure arguments are fully received before parsing
-                    if (!callInfo.name || callInfo.arguments === '') {
-                         console.warn(`Incomplete tool call data for ID ${id}, skipping.`);
+                    // Ensure all parts are present
+                    if (!id || !name || argsString === undefined) { // Check argsString presence
+                         console.warn(`Incomplete tool call data for Index ${index} (ID ${id}), skipping.`);
                          return null;
                     }
 
-                    const args = JSON.parse(callInfo.arguments);
+                    const args = JSON.parse(argsString);
                     // Validate against expected MCP tool names
-                    if (['navigate', 'search', 'click', 'type', 'scroll', 'assert_text', 'dismiss_modal'].includes(callInfo.name)) {
+                    if (['navigate', 'search', 'click', 'type', 'scroll', 'assert_text', 'dismiss_modal'].includes(name)) {
                         return {
-                            tool_call_id: id, // Keep the ID for potential mapping/tracking
-                            tool_name: callInfo.name as McpToolCall['tool_name'],
+                            tool_call_id: id,
+                            tool_name: name as McpToolCall['tool_name'],
                             arguments: args,
                         };
                     } else {
-                         console.warn(`Unknown tool name received: ${callInfo.name}`);
+                         console.warn(`Unknown tool name received: ${name} for Index ${index} (ID ${id})`);
                          return null; // Filter out unknown tools
                     }
                 } catch (error) {
-                    console.error(`Failed to parse arguments for tool call ${id} (${callInfo.name}): ${callInfo.arguments}`, error);
+                    console.error(`Failed to parse arguments for tool call at Index ${index} (ID ${id}, Name ${name}): ${argsString}`, error);
                     return null; // Filter out calls with invalid JSON arguments
                 }
             })
-            // Now the filter correctly narrows PotentialToolCall down to McpToolCall
             .filter((call): call is McpToolCall => call !== null);
-
 
          // Basic validation: Limit to 10 steps as per spec
         if (parsedToolCalls.length > 10) {
             console.warn(`Parser generated ${parsedToolCalls.length} steps, truncating to 10.`);
             return parsedToolCalls.slice(0, 10);
         }
-
 
         return parsedToolCalls;
 

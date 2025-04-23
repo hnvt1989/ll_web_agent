@@ -1,4 +1,17 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
+import StepReviewModal from './components/StepReviewModal'; // Import the modal
+import StatusHUD from './components/StatusHUD'; // Import StatusHUD
+
+// Define step structure (can be imported from backend types if shared)
+interface McpToolCall {
+    tool_call_id: string;
+    tool_name: string;
+    arguments: { [key: string]: any };
+}
+
+// Get the API base URL from environment variables
+// Default to localhost:3000 if not set, which works for docker compose setup
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000';
 
 function App() {
   const [instruction, setInstruction] = useState('');
@@ -6,6 +19,43 @@ function App() {
   const [parseError, setParseError] = useState<string | null>(null);
   const [isStopping, setIsStopping] = useState(false);
   const [stopError, setStopError] = useState<string | null>(null);
+
+  // State for managing parsed steps and review modal
+  const [steps, setSteps] = useState<McpToolCall[]>([]);
+  const [isReviewModalOpen, setIsReviewModalOpen] = useState(false);
+  const [currentStepIndex, setCurrentStepIndex] = useState(0); // 0-based index
+
+  // TODO: Replace with actual state management (e.g., context, Zustand, Redux)
+  // Use strings for state representation in the UI
+  const [sessionState, setSessionState] = useState<string>('IDLE');
+
+  // --- Handlers for Modal --- 
+  const handleAcceptStep = (stepId: string) => {
+    console.log(`User accepted step ID: ${stepId}`);
+    // TODO: Send confirmation to backend/orchestrator
+    // TODO: Move to next step or finish if last step
+    
+    const nextStepIndex = currentStepIndex + 1;
+    if (nextStepIndex < steps.length) {
+        setCurrentStepIndex(nextStepIndex);
+        setIsReviewModalOpen(true); // Keep modal open for next step
+        setSessionState('WAIT_CONFIRM'); // Use string state
+    } else {
+        // Last step was accepted
+        setIsReviewModalOpen(false);
+        setSessionState('IDLE'); // Use string state
+        setSteps([]); // Clear steps
+    }
+  };
+
+  const handleRejectSteps = () => {
+    console.log('User rejected steps');
+    // TODO: Send rejection/cancel signal to backend/orchestrator
+    setIsReviewModalOpen(false);
+    setSteps([]); // Clear steps
+    setCurrentStepIndex(0);
+    setSessionState('IDLE'); // Use string state
+  };
 
   const handleInputChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => { // Changed input to textarea to match InstructionInput
     setInstruction(event.target.value);
@@ -26,7 +76,9 @@ function App() {
     setStopError(null); // Clear previous errors
 
     try {
-      const response = await fetch('/api/parse', { // Assuming InstructionInput is merged or this logic lives here now
+      const apiUrl = `${API_BASE_URL}/api/parse`;
+      console.log('[App.tsx] Fetching:', apiUrl); // <-- Log the URL
+      const response = await fetch(apiUrl, { // Assuming InstructionInput is merged or this logic lives here now
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ instruction }),
@@ -37,8 +89,36 @@ function App() {
         throw new Error(errorMsg);
       }
       const parsedData = await response.json();
-      console.log('Parsing successful:', parsedData);
-      // TODO: Update UI state with parsed steps (passed to StepReviewModal, StatusHUD etc.)
+      console.log('Parsing successful, raw data:', JSON.stringify(parsedData)); // <-- Log raw data
+
+      console.log('[App.tsx] Reached point just before IF check'); // <-- ADD THIS LOG
+      // --- Update UI state with parsed steps --- 
+      // Temporarily simplify the check just to see if the block is entered
+      if (parsedData) { 
+      // if (parsedData && Array.isArray(parsedData.steps) && parsedData.steps.length > 0) { // Original check
+        console.log('Condition met: Steps received (Simplified Check). Attempting to open modal...'); // <-- Log condition met
+        
+        // Original logic inside the IF block:
+        if (parsedData && Array.isArray(parsedData.steps) && parsedData.steps.length > 0) { // Check again inside for safety
+            setSteps(parsedData.steps);
+            setCurrentStepIndex(0); // Start review from the first step
+            setIsReviewModalOpen(true);
+            console.log('Called setIsReviewModalOpen(true)'); // <-- Log state setter call
+            setSessionState('WAIT_CONFIRM'); // Use string state
+        } else {
+             console.log('Condition NOT met within simplified block: No steps array or empty steps.'); // <-- Log if inner check fails
+             setSteps([]);
+             setParseError('Could not parse instruction into actionable steps.');
+             setSessionState('IDLE'); // Use string state
+        }
+      } else {
+        console.log('Condition NOT met: parsedData is falsy.'); // <-- Log condition not met
+        // Handle case where backend returns 200 OK but no steps
+        console.log('Parsing returned no steps.');
+        setSteps([]);
+        setParseError('Could not parse instruction into actionable steps.');
+        setSessionState('IDLE'); // Use string state
+      }
       // setInstruction(''); // Optionally clear
     } catch (err) {
       console.error('Parsing failed:', err);
@@ -56,7 +136,9 @@ function App() {
       setParseError(null); // Clear other errors
 
       try {
-          const response = await fetch('/api/stop', {
+          const stopUrl = `${API_BASE_URL}/api/stop`;
+          console.log('[App.tsx] Fetching:', stopUrl); // <-- Log the URL
+          const response = await fetch(stopUrl, {
               method: 'POST', // Or 'GET' if the backend expects that
               headers: {
                   'Content-Type': 'application/json', // Optional, might not be needed for a simple stop signal
@@ -131,9 +213,16 @@ function App() {
             </button>
          </form>
 
-         {/* TODO: Integrate StepReviewModal and StatusHUD, passing state */}
-         {/* <StepReviewModal isOpen={...} steps={...} ... /> */}
-         {/* <StatusHUD sessionState={...} currentStepIndex={...} totalSteps={...} /> */}
+         {/* Integrate StepReviewModal and StatusHUD, passing state */}
+         <StepReviewModal
+            isOpen={isReviewModalOpen}
+            onOpenChange={setIsReviewModalOpen} // Basic handler to allow closing via overlay click/esc
+            steps={steps}
+            currentStepIndex={currentStepIndex}
+            onAccept={handleAcceptStep} // Pass the accept handler
+            onReject={handleRejectSteps} // Pass the reject handler
+         />
+         <StatusHUD sessionState={sessionState} currentStepIndex={currentStepIndex} totalSteps={steps.length} />
       </div>
     </div>
   );
