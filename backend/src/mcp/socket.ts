@@ -1,179 +1,151 @@
-import WebSocket from 'ws';
+const EventSource = require('eventsource');
+// console.log('Inspecting EventSource module:', EventSource); // Remove inspection log
 import { EventEmitter } from 'events';
 import { McpMessage } from '../types/mcp';
 
 // Define the types for the events
-export interface McpSocketEvents {
+export interface McpSseClientEvents {
   open: () => void;
-  close: (code: number, reason: Buffer) => void;
-  error: (error: Error) => void;
+  close: (event: MessageEvent) => void;
+  error: (error: Event) => void;
   message: (message: McpMessage) => void;
-  reconnecting: (attempt: number, delay: number) => void;
 }
 
 // Use declaration merging to type the EventEmitter
-export declare interface McpSocket {
-  on<K extends keyof McpSocketEvents>(event: K, listener: McpSocketEvents[K]): this;
-  once<K extends keyof McpSocketEvents>(event: K, listener: McpSocketEvents[K]): this;
-  emit<K extends keyof McpSocketEvents>(event: K, ...args: Parameters<McpSocketEvents[K]>): boolean;
-  off<K extends keyof McpSocketEvents>(event: K, listener: McpSocketEvents[K]): this;
-  removeAllListeners<K extends keyof McpSocketEvents>(event?: K): this;
+export declare interface McpSseClient {
+  on<K extends keyof McpSseClientEvents>(event: K, listener: McpSseClientEvents[K]): this;
+  once<K extends keyof McpSseClientEvents>(event: K, listener: McpSseClientEvents[K]): this;
+  emit<K extends keyof McpSseClientEvents>(event: K, ...args: Parameters<McpSseClientEvents[K]>): boolean;
+  off<K extends keyof McpSseClientEvents>(event: K, listener: McpSseClientEvents[K]): this;
+  removeAllListeners<K extends keyof McpSseClientEvents>(event?: K): this;
 }
 
 /**
- * Wraps a WebSocket connection to provide MCP-specific functionality,
- * including automatic reconnection and typed events.
+ * Wraps an EventSource connection for MCP communication via SSE.
  */
-export class McpSocket extends EventEmitter {
-  private ws: WebSocket | null = null;
+export class McpSseClient extends EventEmitter {
+  private es: EventSource | null = null;
   private url: string;
-  private shouldReconnect: boolean = true;
-  private reconnectAttempts: number = 0;
-  private maxReconnectAttempts: number = 10; // Configurable?
-  private initialReconnectDelay: number = 1000; // 1 second
-  private maxReconnectDelay: number = 30000; // 30 seconds
-  private reconnectDelayFactor: number = 1.5; // Exponential backoff factor
-  private reconnectTimer: NodeJS.Timeout | null = null;
+  private isConnected: boolean = false;
 
-  constructor(url: string, maxAttempts = 10, initialDelay = 1000, maxDelay = 30000) {
+  constructor(url: string) {
     super(); // Call EventEmitter constructor
+    // Ensure the URL points to the correct SSE endpoint, e.g., http://.../sse
     this.url = url;
-    this.maxReconnectAttempts = maxAttempts;
-    this.initialReconnectDelay = initialDelay;
-    this.maxReconnectDelay = maxDelay;
+    if (!this.url.endsWith('/sse')) {
+        console.warn(`MCP SSE URL "${this.url}" might be missing the /sse endpoint. Appending it.`);
+        this.url = this.url.endsWith('/') ? this.url + 'sse' : this.url + '/sse';
+    }
   }
 
   /**
-   * Establishes the WebSocket connection and sets up event listeners.
+   * Establishes the EventSource connection and sets up event listeners.
    */
   public connect(): void {
-    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
-      console.log(`Already connected or connecting (state: ${this.ws.readyState}).`);
+    // Use static constants from the class for ready state
+    if (this.es && (this.es.readyState === EventSource.EventSource.CONNECTING || this.es.readyState === EventSource.EventSource.OPEN)) {
+      console.log(`Already connected or connecting (state: ${this.es.readyState}).`);
       return;
     }
 
-    console.log(`Attempting to connect to ${this.url}... (Attempt ${this.reconnectAttempts + 1})`);
-    this.shouldReconnect = true; // Allow reconnection attempts by default
-    this.clearReconnectTimer(); // Clear any existing timer
+    console.log(`Attempting to connect to SSE endpoint ${this.url}...`);
+    
+    const options = {}; 
 
-    this.ws = new WebSocket(this.url);
+    // Correct instantiation using the nested class
+    const Constructor = EventSource.EventSource;
+    this.es = new Constructor(this.url, options);
 
-    this.ws.on('open', this.handleOpen.bind(this));
-    this.ws.on('message', (data: WebSocket.RawData) => this.handleMessage(data));
-    this.ws.on('close', (code: number, reason: Buffer) => this.handleClose(code, reason));
-    this.ws.on('error', (error: Error) => this.handleError(error));
+    this.es.onopen = this.handleOpen.bind(this);
+    this.es.onmessage = (event: MessageEvent) => this.handleMessage(event); // Default 'message' event
+    this.es.onerror = (error: Event) => this.handleError(error);
+    
+    // Note: EventSource doesn't have an explicit 'onclose' like WebSocket.
+    // Closure is typically detected via the 'onerror' event when the connection drops.
   }
 
   /**
-   * Closes the WebSocket connection permanently.
+   * Closes the EventSource connection.
    */
   public disconnect(): void {
-    console.log('Disconnecting permanently...');
-    this.shouldReconnect = false; // Prevent automatic reconnection
-    this.clearReconnectTimer();
-    if (this.ws) {
-      this.ws.removeAllListeners(); // Clean up listeners
-      this.ws.close();
-      this.ws = null;
+    console.log('Disconnecting SSE client permanently...');
+    if (this.es) {
+      this.es.close(); // This stops reconnection attempts
+      this.cleanupListeners();
+      this.es = null;
+      this.isConnected = false; 
+      // Manually emit a close-like event if needed by consumers, though it's less defined for SSE
+      // this.emit('close', /* appropriate arguments? */); 
     }
-    this.reconnectAttempts = 0; // Reset attempts
   }
 
   /**
-   * Sends an MCP message over the WebSocket.
-   * @param message The MCP message to send.
+   * MCP is typically client-driven via HTTP POST for calls, and server-driven via SSE for events.
+   * This client primarily listens for events. Sending calls would be a separate HTTP request logic.
+   * Placeholder for sending, though not standard via SSE itself.
+   * @param message The MCP message to send (conceptually).
    */
   public send(message: McpMessage): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      // console.log('Sending message:', message); // Can be verbose
-      this.ws.send(JSON.stringify(message));
-    } else {
-      console.error('WebSocket is not open. Cannot send message.');
-      // Optionally queue the message or throw an error
-    }
+     console.warn('Sending messages (like MCP calls) is not typically done over the SSE connection.');
+     console.warn('Use standard HTTP POST requests to the MCP server for calls.');
+     // If there was a specific need, logic would go here, but it deviates from standard SSE patterns.
+     // This function might need removal or redesign based on actual MCP interaction flow.
+     // For now, just log the intended message for debugging.
+     console.log('Intended message (not sent via SSE):', message);
   }
 
   // --- Private Event Handlers ---
 
   private handleOpen(): void {
-    console.log(`Connected to ${this.url}`);
-    this.resetReconnectState();
-    this.emit('open');
+    if (!this.isConnected) { // Emit open only on the first successful connection
+        console.log(`SSE Connection opened to ${this.url}`);
+        this.isConnected = true;
+        this.emit('open');
+    } else {
+        // EventSource automatically reconnects, this might fire on reconnect
+        console.log(`SSE Reconnected to ${this.url}`);
+        // Potentially emit a reconnect event if needed
+    }
   }
 
-  private handleMessage(data: WebSocket.RawData): void {
+  private handleMessage(event: MessageEvent): void {
+    // console.log('Raw SSE message received:', event.data); // Log raw data if needed
     try {
-      const message = JSON.parse(data.toString()) as McpMessage;
+      // Assuming the server sends JSON strings in the data field
+      const message = JSON.parse(event.data) as McpMessage; 
       // Basic validation (can be expanded)
       if (message && typeof message === 'object' && 'type' in message) {
          this.emit('message', message);
       } else {
-        console.warn('Received malformed message:', data.toString());
+        console.warn('Received malformed SSE message data:', event.data);
       }
     } catch (error) {
-      console.error('Failed to parse message:', error);
+      console.error('Failed to parse SSE message data:', event.data, error);
     }
   }
 
-  private handleClose(code: number, reason: Buffer): void {
-    console.log(`WebSocket closed. Code: ${code}, Reason: ${reason.toString()}`);
-    this.ws?.removeAllListeners(); // Clean up listeners on the closed socket
-    this.ws = null;
-    this.emit('close', code, reason);
-    if (this.shouldReconnect) {
-      this.scheduleReconnect();
-    }
-  }
-
-  private handleError(error: Error): void {
-    console.error('WebSocket error:', error.message);
+  private handleError(error: Event): void {
+    console.error('SSE Error occurred:', error);
     this.emit('error', error);
-    // WebSocket often emits 'close' after 'error', so reconnect logic is usually handled in handleClose.
-    // However, some errors might warrant immediate close/reconnect attempt.
-    // For simplicity, we rely on the 'close' event for reconnection for now.
-     if (this.ws && (this.ws.readyState === WebSocket.CLOSING || this.ws.readyState === WebSocket.CLOSED)) {
-       // Already closing or closed, handleClose will manage reconnect
-     } else {
-       // Unexpected error while open/connecting, might need forceful close/reconnect
-       this.ws?.terminate(); // Force close if necessary
-     }
-  }
 
-  // --- Private Reconnect Logic ---
-
-  private scheduleReconnect(): void {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error(`Max reconnect attempts (${this.maxReconnectAttempts}) reached. Giving up.`);
-      this.shouldReconnect = false; // Stop trying
-      return;
+    // Check if the connection is closed using static constant
+    if (this.es && this.es.readyState === EventSource.EventSource.CLOSED) {
+        console.log('SSE Connection closed due to error.');
+        this.isConnected = false; // Mark as disconnected
+        this.cleanupListeners(); // Clean up old listeners before potential reconnect attempt by EventSource
+        this.es = null; // Clear reference, EventSource might recreate internally on retry
+        this.emit('close', error as MessageEvent); // Emit close on error-induced closure
+        // EventSource handles reconnection automatically by default. 
+        // We might need logic here if we want to *stop* retrying after N failures.
     }
-
-    const delay = Math.min(
-      this.initialReconnectDelay * Math.pow(this.reconnectDelayFactor, this.reconnectAttempts),
-      this.maxReconnectDelay
-    );
-
-    this.reconnectAttempts++;
-    console.log(`Scheduling reconnect attempt ${this.reconnectAttempts} in ${delay}ms`);
-    this.emit('reconnecting', this.reconnectAttempts, delay);
-
-
-    this.reconnectTimer = setTimeout(() => {
-        this.reconnectTimer = null; // Clear the stored timer ID *before* attempting connect
-        this.connect();
-    }, delay);
   }
-
-  private resetReconnectState(): void {
-    this.reconnectAttempts = 0;
-    this.clearReconnectTimer();
-    // this.shouldReconnect remains true unless disconnect() is called
-  }
-
-  private clearReconnectTimer(): void {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
+  
+  private cleanupListeners(): void {
+      if (this.es) {
+          this.es.onopen = null;
+          this.es.onmessage = null;
+          this.es.onerror = null;
+          // Remove any other custom event listeners if added
+      }
   }
 } 

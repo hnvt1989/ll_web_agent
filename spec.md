@@ -1,9 +1,9 @@
 # Project Specification (v2): Natural‑Language‑Driven Web Automation Tool with MCP Integration
 
 ## 1. Overview
-This application lets a user describe a web‑browsing task in plain English (e.g., “Go to YouTube and search for funny cat videos”).  
+This application lets a user describe a web‑browsing task in plain English (e.g., "Go to YouTube and search for funny cat videos").  
 The backend parses the request into **≤ 10 sequential steps**, confirms each step with the user, and executes them in a visible browser window.  
-**Version 2 replaces the custom Playwright driver with a Model Context Protocol (MCP) implementation—Playwright‑MCP—so every browser action is now an MCP tool call.**
+**Version 2 replaces the custom Playwright driver with a Model Context Protocol (MCP) implementation—Playwright‑MCP—so every browser action is now an MCP tool call.**
 
 ---
 
@@ -46,10 +46,10 @@ The backend parses the request into **≤ 10 sequential steps**, confirms each
 │ Control  │ ───────────────▶│  Backend Service       │
 │   UI     │                 │  ├─ Parser & Validator │
 └──────────┘                 │  ├─ Step Orchestrator  │
-        ▲  Status / Snapshots│  └─ MCP Client (WS)    │
+        ▲  Status / Snapshots│  └─ MCP Client (SSE)    │
         │                    └──────────┬─────────────┘
         ╰────────────────────────────────┘
-                              (WebSocket MCP)
+                              (SSE MCP)
                          ┌────────────────────────┐
                          │  Playwright‑MCP Server │
                          │  (isolated Chromium)   │
@@ -63,16 +63,16 @@ The backend parses the request into **≤ 10 sequential steps**, confirms each
 |--------|---------|
 | **Parser** | Convert NL → list of MCP `tool_call` objects |
 | **Step Orchestrator** | Manage confirmation, retries, and timeouts |
-| **MCP Client** | Maintain persistent WS to Playwright‑MCP; stream events back to UI |
+| **MCP Client** | Maintain persistent SSE connection to Playwright‑MCP; stream events back to UI |
 
 ### 3.2 Deployment
-1. **Start MCP server**  
+1. **Start MCP server** (with SSE port)
    ```bash
-   npx playwright-mcp start --port 9000
+   npx @playwright/mcp@latest --port 9000
    ```
-2. **Run backend**  
+2. **Run backend**
    ```bash
-   export MCP_SERVER_WS=ws://localhost:9000
+   export MCP_SERVER_SSE_URL=http://localhost:9000/sse
    npm run backend:start
    ```
 

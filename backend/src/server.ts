@@ -7,15 +7,19 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // --- Environment Variables --- 
-const MCP_SERVER_WS_URL = process.env.MCP_SERVER_WS; // Get MCP URL from environment
+// const MCP_SERVER_WS_URL = process.env.MCP_SERVER_WS; // Get MCP URL from environment
+const MCP_SERVER_SSE_URL = process.env.MCP_SERVER_SSE_URL; // Get MCP SSE URL from environment
 
-if (!MCP_SERVER_WS_URL) {
-    console.error('Error: MCP_SERVER_WS environment variable is not set.');
+// if (!MCP_SERVER_WS_URL) {
+if (!MCP_SERVER_SSE_URL) {
+    // console.error('Error: MCP_SERVER_WS environment variable is not set.');
+    console.error('Error: MCP_SERVER_SSE_URL environment variable is not set.');
     process.exit(1); // Exit if MCP URL is missing
 }
 
 // --- Instantiate Orchestrator (Singleton for simplicity) ---
-const orchestrator = new Orchestrator(MCP_SERVER_WS_URL);
+// const orchestrator = new Orchestrator(MCP_SERVER_WS_URL);
+const orchestrator = new Orchestrator(MCP_SERVER_SSE_URL);
 
 // --- Middleware ---
 // Enable CORS for all origins (adjust for production if needed)
@@ -119,5 +123,6 @@ app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
 // --- Start Server ---
 app.listen(PORT, () => {
   console.log(`Backend server listening on port ${PORT}`);
-  console.log(`Connecting to MCP Server at: ${MCP_SERVER_WS_URL}`);
+  // console.log(`Connecting to MCP Server at: ${MCP_SERVER_WS_URL}`);
+  console.log(`Connecting to MCP Server via SSE at: ${MCP_SERVER_SSE_URL}`);
 }); 

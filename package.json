@@ -13,6 +13,7 @@
     "packages/config/*"
   ],
   "devDependencies": {
-    "@playwright/test": "^1.52.0"
+    "@playwright/test": "^1.52.0",
+    "@tsconfig/strictest": "^2.0.5"
   }
 }

@@ -1,5 +1,5 @@
 import { OrchestratorFsm, OrchestratorState, OrchestratorEvent, FsmContext } from './fsm';
-import { McpSocket } from '../mcp/socket';
+import { McpSseClient } from '../mcp/socket';
 import { McpMessage } from '../types/mcp';
 import { parseInstruction } from '../parser/parseInstruction';
 // Import the function to translate MCP messages to FSM events
@@ -20,26 +20,26 @@ interface SessionData {
 }
 
 export class Orchestrator {
-    private mcpSocket: McpSocket;
+    private mcpClient: McpSseClient;
     private session: SessionData | null = null;
     private mcpServerUrl: string;
 
     constructor(mcpServerUrl: string) {
         this.mcpServerUrl = mcpServerUrl;
-        this.mcpSocket = this.initializeMcpSocket();
+        this.mcpClient = this.initializeMcpClient();
         // No initial session
     }
 
-    private initializeMcpSocket(): McpSocket {
-        const socket = new McpSocket(this.mcpServerUrl);
+    private initializeMcpClient(): McpSseClient {
+        const client = new McpSseClient(this.mcpServerUrl);
 
-        socket.on('open', () => {
-            console.log('[Orchestrator] MCP Socket Connected.');
+        client.on('open', () => {
+            console.log('[Orchestrator] MCP SSE Client Connected.');
             // Handle connection logic if needed (e.g., maybe reset state if disconnected mid-session)
         });
 
-        socket.on('message', (message: McpMessage) => {
-            console.log('[Orchestrator] Received MCP message:', JSON.stringify(message));
+        client.on('message', (message: McpMessage) => {
+            console.log('[Orchestrator] Received MCP message via SSE:', JSON.stringify(message));
             if (this.session) {
                 // Translate message to FSM event
                 const event = translateMcpMessageToEvent(message, this.session.fsm.getContext());
@@ -55,32 +55,28 @@ export class Orchestrator {
             }
         });
 
-        socket.on('close', (code, reason) => {
-            console.log(`[Orchestrator] MCP Socket Closed. Code: ${code}, Reason: ${reason.toString()}`);
+        client.on('close', (event: Event) => {
+            console.log(`[Orchestrator] MCP SSE Client Closed. Event:`, event);
             // Handle disconnection - maybe transition FSM to ERROR or IDLE if session active?
             if (this.session && this.session.fsm.getCurrentState() !== OrchestratorState.IDLE) {
-                 console.warn('[Orchestrator] MCP disconnected during active session. Resetting to IDLE.');
+                 console.warn('[Orchestrator] MCP SSE client disconnected during active session. Resetting to IDLE.');
                  // Force state to IDLE - needs careful consideration of side effects
                  this.resetSession(OrchestratorState.IDLE); 
             }
         });
 
-        socket.on('error', (error) => {
-            console.error('[Orchestrator] MCP Socket Error:', error.message);
+        client.on('error', (error: Event) => {
+            console.error('[Orchestrator] MCP SSE Client Error:', error);
             // Error handling, potentially dispatch ERROR to FSM or reset
             if (this.session && this.session.fsm.getCurrentState() !== OrchestratorState.IDLE) {
-                 console.warn('[Orchestrator] MCP socket error during active session. Resetting to IDLE.');
+                 console.warn('[Orchestrator] MCP SSE client error during active session. Resetting to IDLE.');
                  this.resetSession(OrchestratorState.ERROR); // Go to error state
             }
         });
 
-        socket.on('reconnecting', (attempt, delay) => {
-            console.log(`[Orchestrator] MCP Socket attempting to reconnect: Attempt ${attempt}, Delay ${delay}ms`);
-        });
-        
         // Attempt initial connection
-        socket.connect();
-        return socket;
+        client.connect();
+        return client;
     }
 
     // Method to handle FSM state updates
@@ -106,7 +102,7 @@ export class Orchestrator {
              case OrchestratorState.ERROR:
                  console.error('[Orchestrator] FSM entered ERROR state. Session halted.');
                  // Optionally attempt to close MCP connection cleanly
-                 // this.mcpSocket.disconnect(); 
+                 // this.mcpClient.disconnect(); 
                  break;
              // Other states like REVIEW, WAIT_CONFIRM typically wait for external triggers (API calls)
              // or internal triggers (parsing complete, MCP responses)
@@ -226,7 +222,7 @@ export class Orchestrator {
             // tool_call_id is internal from parser, not part of MCP 'call' message structure
         };
 
-        this.mcpSocket.send(callMessage);
+        this.mcpClient.send(callMessage);
         // Now wait for result/error message via McpSocket 'message' event handler
     }
 

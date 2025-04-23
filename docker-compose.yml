@@ -6,12 +6,21 @@ networks:
 
 services:
   playwright-mcp:
-    image: mcr.microsoft.com/playwright:v1.42.0-jammy # Use the standard Playwright image with Node.js
+    build:
+      context: .
+      dockerfile: mcp-server.Dockerfile
     container_name: mcp-server # Explicit hostname for backend connection
-    command: npx playwright-mcp start --port 9000 --host 0.0.0.0 # Listen on all interfaces within the container
+    # command: is now defined in the Dockerfile CMD
     networks:
       - automation-net
-    # Note: Port 9000 is internal to the Docker network, not exposed to host
+    healthcheck:
+      # Guessing pnpm start runs a node process. May need adjustment.
+      test: ["CMD", "pgrep", "-f", "node"] 
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s # Allow more time for build steps if needed on first run
+    # Note: Port 59985 is internal to the Docker network, not exposed to host
 
   backend:
     build:
@@ -22,7 +31,8 @@ services:
       - "3000:3000" # Expose backend port to host
     environment:
       # Backend connects to MCP server via its container name on the Docker network
-      - MCP_SERVER_WS=ws://mcp-server:9000
+      # - MCP_SERVER_WS=ws://mcp-server:59985/ # Use official default WS port 59985 and path /
+      - MCP_SERVER_SSE_URL=http://mcp-server:59985/sse # Use SSE endpoint
       # Pass the OpenAI API Key from the .env file
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       # Add any other necessary backend environment variables here
@@ -30,7 +40,8 @@ services:
     networks:
       - automation-net
     depends_on:
-      - playwright-mcp # Wait for MCP server to start (basic check)
+      playwright-mcp:
+        condition: service_healthy
 
   ui:
     build:
@@ -47,4 +58,6 @@ services:
     networks:
       - automation-net
     depends_on:
-      - backend # Wait for backend to be available (basic check) 
+      backend:
+        condition: service_started
+ 
