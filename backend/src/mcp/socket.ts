@@ -1,4 +1,4 @@
-import * as WebSocket from 'ws';
+import WebSocket from 'ws';
 import { EventEmitter } from 'events';
 import { McpMessage } from '../types/mcp';
 
@@ -47,13 +47,9 @@ export class McpSocket extends EventEmitter {
    * Establishes the WebSocket connection and sets up event listeners.
    */
   public connect(): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      console.log('Already connected.');
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+      console.log(`Already connected or connecting (state: ${this.ws.readyState}).`);
       return;
-    }
-    if (this.ws && this.ws.readyState === WebSocket.CONNECTING) {
-        console.log('Connection attempt already in progress.');
-        return;
     }
 
     console.log(`Attempting to connect to ${this.url}... (Attempt ${this.reconnectAttempts + 1})`);
@@ -63,9 +59,9 @@ export class McpSocket extends EventEmitter {
     this.ws = new WebSocket(this.url);
 
     this.ws.on('open', this.handleOpen.bind(this));
-    this.ws.on('message', this.handleMessage.bind(this));
-    this.ws.on('close', this.handleClose.bind(this));
-    this.ws.on('error', this.handleError.bind(this));
+    this.ws.on('message', (data: WebSocket.RawData) => this.handleMessage(data));
+    this.ws.on('close', (code: number, reason: Buffer) => this.handleClose(code, reason));
+    this.ws.on('error', (error: Error) => this.handleError(error));
   }
 
   /**

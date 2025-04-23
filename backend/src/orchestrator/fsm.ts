@@ -80,7 +80,7 @@ export class OrchestratorFsm {
         }, CONFIRMATION_TIMEOUT_MS);
      }
 
-    private clearConfirmationTimer() {
+    public clearConfirmationTimer() {
         if (this.confirmationTimerId) {
             console.log('Clearing confirmation timer.');
             clearTimeout(this.confirmationTimerId);
