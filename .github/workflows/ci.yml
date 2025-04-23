@@ -1,0 +1,66 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  # Add other jobs like lint, build, unit tests here if needed
+
+  e2e:
+    name: End-to-End Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 # Set a timeout for the E2E job
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Start services via Docker Compose
+        run: docker-compose up --build -d
+        # The --build flag ensures images are built if they don't exist or Dockerfiles changed
+        # The -d flag runs containers in detached mode
+
+      - name: Wait for UI service to be ready
+        run: |
+          echo "Waiting for UI service..."
+          timeout 60 bash -c \
+            'while ! curl -sSf http://localhost:5173 > /dev/null; \
+            do echo "UI not responding yet..."; sleep 2; \
+            done'
+          echo "UI service is up!"
+        env:
+          UI_PORT: 5173 # Port exposed by the UI service in docker-compose.yml
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18' # Or your project's required Node version
+
+      - name: Install project dependencies (if needed for tests)
+        run: npm ci # Or yarn install --frozen-lockfile
+        # Run this if your Playwright config or tests depend on project node_modules
+
+      - name: Install Playwright Browsers
+        run: npx playwright install --with-deps
+        # Installs browsers needed by Playwright
+
+      - name: Run Playwright tests
+        run: npx playwright test
+        env:
+          # Pass necessary env vars if your tests need them
+          # Example: Assuming tests use the default localhost ports exposed by Docker
+          UI_URL: http://localhost:5173
+          # MCP_SERVER_WS is handled internally via Docker network, tests likely hit UI/Backend ports
+
+      - name: Stop services (always run)
+        if: always() # Ensures cleanup even if tests fail
+        run: |
+          echo "Stopping Docker Compose services..."
+          docker-compose down --remove-orphans
+          echo "Services stopped." 

@@ -35,7 +35,7 @@ The backend parses the request into **≤ 10 sequential steps**, confirms each
 
 ### 2.5 UI Behavior
 * Control UI (React) is separate from the browser window.  
-* Shows confirmation modal, visual overlays, status indicators, and a manual **“Stop Session”** button.
+* Shows confirmation modal, visual overlays, status indicators, and a manual **"Stop Session"** button.
 
 ---
 
@@ -73,7 +73,7 @@ The backend parses the request into **≤ 10 sequential steps**, confirms each
 2. **Run backend**  
    ```bash
    export MCP_SERVER_WS=ws://localhost:9000
-   pnpm backend:start
+   npm run backend:start
    ```
 
 ---

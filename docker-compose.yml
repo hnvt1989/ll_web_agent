@@ -1,0 +1,49 @@
+version: '3.8'
+
+networks:
+  automation-net:
+    driver: bridge
+
+services:
+  playwright-mcp:
+    image: mcr.microsoft.com/playwright/python:v1.42.0-jammy # Use an official Playwright image
+    container_name: mcp-server # Explicit hostname for backend connection
+    command: npx playwright-mcp start --port 9000 --host 0.0.0.0 # Listen on all interfaces within the container
+    networks:
+      - automation-net
+    # Note: Port 9000 is internal to the Docker network, not exposed to host
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile # Assuming standard Dockerfile name
+    container_name: backend-service
+    ports:
+      - "3000:3000" # Expose backend port to host
+    environment:
+      # Backend connects to MCP server via its container name on the Docker network
+      - MCP_SERVER_WS=ws://mcp-server:9000
+      # Add any other necessary backend environment variables here
+      # - NODE_ENV=development
+    networks:
+      - automation-net
+    depends_on:
+      - playwright-mcp # Wait for MCP server to start (basic check)
+
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile # Assuming standard Dockerfile name
+    container_name: ui-service
+    ports:
+      - "5173:5173" # Expose UI port to host (as requested)
+    environment:
+      # If UI needs to talk to backend, use backend container name
+      # Example for Vite React App:
+      - VITE_BACKEND_URL=http://backend-service:3000
+      # Add any other necessary UI environment variables here
+      # - NODE_ENV=development
+    networks:
+      - automation-net
+    depends_on:
+      - backend # Wait for backend to be available (basic check) 

@@ -13,3 +13,11 @@
 - [x] Prompt 4.3: Create StepReviewModal component (ui/src/components/StepReviewModal.tsx) 
 - [x] Prompt 4.4: Create StatusHUD component (ui/src/components/StatusHUD.tsx) 
 - [x] Prompt 4.5: Add Stop Session button to App.tsx (ui/src/App.tsx) 
+- [x] Prompt 5.1: Create highlight/scroll snippet (backend/src/overlay/snippet.ts) 
+- [x] Prompt 5.2: Enhance overlay snippet with pulse animation (backend/src/overlay/snippet.ts) 
+- [x] Prompt 5.3: Add removeOverlay function to snippet (backend/src/overlay/snippet.ts) 
+- [x] Prompt 6.1: Create basic E2E test (e2e/basicFlow.spec.ts) 
+- [x] Prompt 6.2: Create docker-compose.yml 
+- [x] Prompt 6.3: Add e2e job to GitHub Actions workflow (.github/workflows/ci.yml) 
+- [x] Prompt 7.1: Create multi-stage Dockerfile (Dockerfile) 
+- [x] Prompt 7.2: Create GHCR release workflow (.github/workflows/release.yml) 
