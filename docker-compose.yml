@@ -31,8 +31,8 @@ services:
       - "3000:3000" # Expose backend port to host
     environment:
       # Backend connects to MCP server via its container name on the Docker network
-      # - MCP_SERVER_WS=ws://mcp-server:59985/ # Use official default WS port 59985 and path /
-      - MCP_SERVER_SSE_URL=http://mcp-server:59985/sse # Use SSE endpoint
+      # - MCP_SERVER_SSE_URL=http://mcp-server:59985/sse # Use SSE endpoint
+      - MCP_SERVER_BASE_URL=http://mcp-server:59985 # Base URL for POST calls
       # Pass the OpenAI API Key from the .env file
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       # Add any other necessary backend environment variables here

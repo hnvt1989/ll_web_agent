@@ -4,7 +4,7 @@ import { Stream } from 'openai/streaming';
 // Define the structure for an MCP tool call based on spec.md
 // We might need to refine this based on actual Playwright-MCP requirements
 interface McpToolCall {
-    tool_name: 'navigate' | 'search' | 'click' | 'type' | 'scroll' | 'assert_text' | 'dismiss_modal';
+    tool_name: 'browser_navigate' | 'browser_search' | 'browser_click' | 'browser_type' | 'scroll' | 'assert_text' | 'browser_handle_dialog';
     arguments: { [key: string]: any };
     tool_call_id?: string; // Added for potential OpenAI response mapping
 }
@@ -27,7 +27,7 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
         {
             type: 'function',
             function: {
-                name: 'navigate',
+                name: 'browser_navigate',
                 description: 'Navigate the browser to a specific URL.',
                 parameters: {
                     type: 'object',
@@ -41,13 +41,13 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
         {
             type: 'function',
             function: {
-                name: 'search',
+                name: 'browser_search',
                 description: 'Perform a search on the page using a query and optional selector.',
                 parameters: {
                     type: 'object',
                     properties: {
                         query: { type: 'string', description: 'The search term.' },
-                        selector: { type: 'string', description: '(Optional) CSS selector for the search input field.' },
+                        selector: { type: 'string', description: 'CSS selector for the search input field. May need refinement based on snapshot `ref`.' },
                     },
                     required: ['query'],
                 },
@@ -56,30 +56,32 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
         {
             type: 'function',
             function: {
-                name: 'click',
-                description: 'Click on an element identified by a CSS selector.',
+                name: 'browser_click',
+                description: 'Click on an element identified by a CSS selector or reference.',
                 parameters: {
                     type: 'object',
                     properties: {
-                        selector: { type: 'string', description: 'CSS selector for the element to click.' },
+                        ref: { type: 'string', description: 'The exact target element reference from the page snapshot.' },
+                        element: { type: 'string', description: 'Human-readable element description used to obtain permission.'}
                     },
-                    required: ['selector'],
+                    required: ['ref', 'element'],
                 },
             },
         },
         {
              type: 'function',
              function: {
-                name: 'type',
-                description: 'Type text into an input field identified by a selector.',
+                name: 'browser_type',
+                description: 'Type text into an input field identified by reference.',
                 parameters: {
                     type: 'object',
                     properties: {
-                        selector: { type: 'string', description: 'CSS selector for the input field.' },
+                         ref: { type: 'string', description: 'Exact target element reference from the page snapshot.' },
+                         element: { type: 'string', description: 'Human-readable element description.'},
                         text: { type: 'string', description: 'The text to type.' },
-                        isPassword: { type: 'boolean', description: 'Whether the text is a password (for masking). Defaults to false.' }
+                         submit: { type: 'boolean', description: 'Whether to press Enter after typing. Default false.', default: false },
                     },
-                    required: ['selector', 'text'],
+                     required: ['ref', 'element', 'text'],
                 },
             },
         },
@@ -87,7 +89,7 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
              type: 'function',
              function: {
                 name: 'scroll',
-                description: 'Scroll the page up, down, left, or right by a specified amount or to an edge.',
+                description: 'Scroll the page up, down, left, or right by a specified amount or to an edge. (Note: May not directly map to a standard Playwright MCP tool)',
                 parameters: {
                     type: 'object',
                     properties: {
@@ -102,7 +104,7 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
             type: 'function',
             function: {
                 name: 'assert_text',
-                description: 'Verify that an element contains specific text.',
+                description: 'Verify that an element contains specific text. (Note: May not directly map to a standard Playwright MCP tool)',
                 parameters: {
                     type: 'object',
                     properties: {
@@ -116,46 +118,44 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
         {
              type: 'function',
              function: {
-                name: 'dismiss_modal',
-                description: 'Attempt to automatically dismiss any detected modal dialog or pop-up.',
-                parameters: { type: 'object', properties: {} }, // No parameters needed
+                name: 'browser_handle_dialog',
+                description: 'Attempt to automatically dismiss any detected modal dialog or pop-up by accepting or dismissing it.',
+                 parameters: {
+                    type: 'object',
+                     properties: {
+                         accept: { type: 'boolean', description: 'Whether to accept the dialog. Defaults to true (dismiss).' }
+                    },
+                 },
              },
          },
     ];
 
     try {
         const stream: Stream<OpenAI.Chat.Completions.ChatCompletionChunk> = await openai.chat.completions.create({
-            model: 'gpt-4-turbo', // Or your preferred model supporting function calling
+            model: 'gpt-4-turbo',
             messages: [
-                { role: 'system', content: 'You are a web automation assistant. Convert the user\'s instruction into a sequence of tool calls based on the available tools. Generate a maximum of 10 steps.' },
+                { role: 'system', content: 'You are a web automation assistant. Convert the user\'s instruction into a sequence of tool calls based on the available tools. Generate a maximum of 10 steps. Use the tool names starting with \'browser_\'. For click and type actions, prioritize using the \'ref\' and \'element\' parameters based on accessibility snapshots when available.' },
                 { role: 'user', content: instruction },
             ],
             tools: tools,
-            tool_choice: 'auto', // Let the model decide which tools to call
+            tool_choice: 'auto',
             stream: true,
         });
 
-        // Refactored: Temporary storage based on index
         const intermediateChunks: { [index: number]: { id?: string; name?: string; arguments: string } } = {};
 
-        console.log('[parseInstruction] Starting stream processing...');
-        console.log('[parseInstruction] Entering for await loop...');
         for await (const chunk of stream) {
             const delta = chunk.choices[0]?.delta;
 
             if (delta?.tool_calls) {
                 for (const toolCallDelta of delta.tool_calls) {
                     const index = toolCallDelta.index;
-                    // Log details specifically about the tool call delta
-                    console.log(`[parseInstruction] Received tool_call delta for Index: ${index}`, JSON.stringify(toolCallDelta));
 
                     if (index !== undefined) {
-                         // Ensure entry exists for this index
                          if (!intermediateChunks[index]) {
                              intermediateChunks[index] = { arguments: '' };
                          }
 
-                         // Update fields if present in the delta
                          if (toolCallDelta.id) {
                              intermediateChunks[index].id = toolCallDelta.id;
                          }
@@ -169,31 +169,25 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
                 }
             }
         }
-        console.log('[parseInstruction] Finished stream processing.');
-        console.log('[parseInstruction] Assembled Intermediate Chunks (by index):', JSON.stringify(intermediateChunks));
 
-        // Process the assembled intermediate chunks
         type PotentialToolCall = McpToolCall | null;
 
-        const parsedToolCalls: McpToolCall[] = Object.values(intermediateChunks) // Process values (assembled calls)
-             // Ensure sorting by index if needed, though Object.values might preserve insertion order for numeric keys
-             // .sort((a, b) => /* compare based on original index if stored */) 
-            .map((callInfo, index): PotentialToolCall => { // Map returns PotentialToolCall
+        const validToolNames = tools.map(t => t.function.name) as McpToolCall['tool_name'][];
+
+        const parsedToolCalls: McpToolCall[] = Object.values(intermediateChunks)
+            .map((callInfo, index): PotentialToolCall => {
                 const id = callInfo.id;
                 const name = callInfo.name;
                 const argsString = callInfo.arguments;
-                console.log(`[parseInstruction] Processing assembled chunk for Index ${index} (ID ${id}):`, JSON.stringify(callInfo));
 
                 try {
-                    // Ensure all parts are present
-                    if (!id || !name || argsString === undefined) { // Check argsString presence
+                    if (!id || !name || argsString === undefined) {
                          console.warn(`Incomplete tool call data for Index ${index} (ID ${id}), skipping.`);
                          return null;
                     }
 
                     const args = JSON.parse(argsString);
-                    // Validate against expected MCP tool names
-                    if (['navigate', 'search', 'click', 'type', 'scroll', 'assert_text', 'dismiss_modal'].includes(name)) {
+                    if (validToolNames.includes(name as McpToolCall['tool_name'])) {
                         return {
                             tool_call_id: id,
                             tool_name: name as McpToolCall['tool_name'],
@@ -201,26 +195,25 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
                         };
                     } else {
                          console.warn(`Unknown tool name received: ${name} for Index ${index} (ID ${id})`);
-                         return null; // Filter out unknown tools
+                         return null;
                     }
                 } catch (error) {
                     console.error(`Failed to parse arguments for tool call at Index ${index} (ID ${id}, Name ${name}): ${argsString}`, error);
-                    return null; // Filter out calls with invalid JSON arguments
+                    return null;
                 }
             })
             .filter((call): call is McpToolCall => call !== null);
 
-         // Basic validation: Limit to 10 steps as per spec
         if (parsedToolCalls.length > 10) {
             console.warn(`Parser generated ${parsedToolCalls.length} steps, truncating to 10.`);
             return parsedToolCalls.slice(0, 10);
         }
 
+        console.log('[parseInstruction] Successfully parsed calls:', JSON.stringify(parsedToolCalls, null, 2));
         return parsedToolCalls;
 
     } catch (error) {
         console.error("Error during OpenAI API call or streaming:", error);
-        // Depending on requirements, could return an empty list or throw
         return [];
     }
 }

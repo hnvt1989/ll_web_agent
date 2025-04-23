@@ -30,11 +30,39 @@ function App() {
   const [sessionState, setSessionState] = useState<string>('IDLE');
 
   // --- Handlers for Modal --- 
-  const handleAcceptStep = (stepId: string) => {
+  const handleAcceptStep = async (stepId: string) => {
     console.log(`User accepted step ID: ${stepId}`);
     // TODO: Send confirmation to backend/orchestrator
-    // TODO: Move to next step or finish if last step
     
+    // --- Send confirmation to backend --- 
+    try {
+      const confirmUrl = `${API_BASE_URL}/api/confirm`;
+      const response = await fetch(confirmUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stepId }), // Send the accepted step ID
+      });
+
+      if (!response.ok) {
+        // Try to get error details from backend response
+        let errorMsg = `Confirmation failed: ${response.status} ${response.statusText}`;
+        try { const errorData = await response.json(); errorMsg = errorData.message || errorMsg; } catch (e) { /* ignore */ }
+        throw new Error(errorMsg);
+      }
+      
+      // Response received (likely 202 Accepted), now update UI state
+      console.log(`Confirmation for step ${stepId} sent successfully.`);
+
+    } catch (err) {
+      console.error('Error sending confirmation:', err);
+      // TODO: Display this error to the user (e.g., using a state variable like parseError/stopError)
+      setParseError(err instanceof Error ? err.message : 'Failed to confirm step with backend.'); // Reuse parseError state for now
+      // Optionally revert UI state or stop processing further steps on error
+      return; // Stop processing if confirmation failed
+    }
+    // --- End send confirmation --- 
+
+    // TODO: Move to next step or finish if last step
     const nextStepIndex = currentStepIndex + 1;
     if (nextStepIndex < steps.length) {
         setCurrentStepIndex(nextStepIndex);

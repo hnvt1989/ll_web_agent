@@ -94,11 +94,11 @@ export class OrchestratorFsm {
      * Manages context like retry counts and timers.
      *
      * @param event The event to process.
-     * @param payload Optional data associated with the event (e.g., parsed steps).
+     * @param payload Optional data associated with the event (e.g., parsed steps, result, error).
      */
-    public dispatch(event: OrchestratorEvent, payload?: { steps?: any[] }): void {
+    public dispatch(event: OrchestratorEvent, payload?: { steps?: any[]; result?: any; error?: any }): void {
         const previousState = this.currentState;
-        console.log(`Dispatching Event: ${event}, Current State: ${this.currentState}`);
+        console.log(`Dispatching Event: ${event}, Current State: ${this.currentState}, Payload:`, payload);
 
         // --- State Transition Logic ---
         switch (this.currentState) {

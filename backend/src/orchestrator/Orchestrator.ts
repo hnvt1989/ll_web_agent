@@ -1,9 +1,10 @@
 import { OrchestratorFsm, OrchestratorState, OrchestratorEvent, FsmContext } from './fsm';
 import { McpSseClient } from '../mcp/socket';
-import { McpMessage } from '../types/mcp';
+import { McpMessage, Result, Error as McpError } from '../types/mcp';
 import { parseInstruction } from '../parser/parseInstruction';
 // Import the function to translate MCP messages to FSM events
 import { translateMcpMessageToEvent } from './events'; 
+import axios from 'axios';
 
 // Define the structure for an MCP tool call (align with parser)
 interface McpToolCall {
@@ -22,16 +23,23 @@ interface SessionData {
 export class Orchestrator {
     private mcpClient: McpSseClient;
     private session: SessionData | null = null;
-    private mcpServerUrl: string;
+    private mcpServerBaseUrl: string;
 
-    constructor(mcpServerUrl: string) {
-        this.mcpServerUrl = mcpServerUrl;
+    constructor(mcpServerBaseUrl: string) {
+        this.mcpServerBaseUrl = mcpServerBaseUrl;
         this.mcpClient = this.initializeMcpClient();
         // No initial session
     }
 
     private initializeMcpClient(): McpSseClient {
-        const client = new McpSseClient(this.mcpServerUrl);
+        let sseUrl = this.mcpServerBaseUrl;
+        if (!sseUrl.endsWith('/')) {
+            sseUrl += '/';
+        }
+        sseUrl += 'sse'; 
+        
+        console.log(`[Orchestrator] Initializing SSE client for URL: ${sseUrl}`);
+        const client = new McpSseClient(sseUrl);
 
         client.on('open', () => {
             console.log('[Orchestrator] MCP SSE Client Connected.');
@@ -40,6 +48,8 @@ export class Orchestrator {
 
         client.on('message', (message: McpMessage) => {
             console.log('[Orchestrator] Received MCP message via SSE:', JSON.stringify(message));
+            // Note: Direct results/errors from calls made via executeStep (POST) are handled there.
+            // This handler should now primarily process asynchronous events initiated by the MCP server itself (if any).
             if (this.session) {
                 // Translate message to FSM event
                 const event = translateMcpMessageToEvent(message, this.session.fsm.getContext());
@@ -202,28 +212,101 @@ export class Orchestrator {
     }
 
     // Executes the step via MCP Socket
-    private executeStep(stepIndex: number): void {
+    // Update to make async and use HTTP POST
+    private async executeStep(stepIndex: number): Promise<void> { 
         if (!this.session || stepIndex < 0 || stepIndex >= this.session.steps.length) {
             console.error(`[Orchestrator] Invalid stepIndex ${stepIndex} for execution.`);
-            this.session?.fsm.dispatch(OrchestratorEvent.STEP_FAILED); // Dispatch failure
-            this.handleStateChange(this.session!.fsm.getCurrentState(), this.session!.fsm.getContext());
+            // Ensure session exists before dispatching
+            if(this.session) { 
+                this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED); 
+                this.handleStateChange(this.session.fsm.getCurrentState(), this.session.fsm.getContext());
+            }
             return;
         }
 
         const stepToExecute = this.session.steps[stepIndex];
-        console.log(`[Orchestrator] Executing Step ${stepIndex + 1}/${this.session.steps.length}:`, stepToExecute);
+        const currentCallId = Date.now(); // Generate unique ID for this call
+        console.log(`[Orchestrator] Executing Step ${stepIndex + 1}/${this.session.steps.length} (Call ID: ${currentCallId}):`, stepToExecute);
 
         // Format as an MCP 'call' message
         const callMessage: McpMessage = {
             type: 'call',
-            id: Date.now(), // Use timestamp or a proper sequence generator for unique IDs
+            id: currentCallId, 
             method: stepToExecute.tool_name,
             params: stepToExecute.arguments,
-            // tool_call_id is internal from parser, not part of MCP 'call' message structure
         };
 
-        this.mcpClient.send(callMessage);
-        // Now wait for result/error message via McpSocket 'message' event handler
+        // Log the message being sent
+        console.log(`[Orchestrator] Sending MCP call via POST:`, JSON.stringify(callMessage, null, 2));
+
+        // Remove the SSE client send call
+        // this.mcpClient.send(callMessage);
+        
+        // --- Send via HTTP POST --- 
+        try {
+            // Use the base URL stored during construction. MCP calls are sent to the base endpoint.
+            const response = await axios.post<Result | McpError>(this.mcpServerBaseUrl, callMessage, {
+                headers: { 'Content-Type': 'application/json' },
+                timeout: 30000 // Example: 30 second timeout
+            });
+
+            const responseData = response.data;
+            console.log(`[Orchestrator] Received HTTP response for Call ID ${currentCallId}:`, responseData);
+
+            // Check if session still exists (could have been cancelled while waiting)
+            if (!this.session) { 
+                console.warn(`[Orchestrator] Session ended while awaiting response for Call ID ${currentCallId}. Ignoring response.`);
+                return;
+            }
+            
+            // Validate response structure and ID
+            if (responseData && typeof responseData === 'object' && responseData.id === currentCallId) {
+                if (responseData.type === 'result') {
+                    console.log(`[Orchestrator] Step ${stepIndex + 1} completed successfully.`);
+                    // Check if it was the last step
+                    const isLastStep = this.session.fsm.getContext().currentStepIndex >= this.session.fsm.getContext().totalSteps - 1;
+                    const successEvent = isLastStep ? OrchestratorEvent.STEP_SUCCESS_LAST : OrchestratorEvent.STEP_SUCCESS_NEXT;
+                    // Dispatch correct event with result payload
+                    this.session.fsm.dispatch(successEvent, { result: responseData.result });
+                } else if (responseData.type === 'error') {
+                    console.error(`[Orchestrator] Step ${stepIndex + 1} failed. MCP Error:`, responseData.error);
+                    // Dispatch failure with error payload
+                    this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: responseData.error });
+                } else {
+                     console.error(`[Orchestrator] Received unexpected response structure for Call ID ${currentCallId}:`, responseData);
+                     // Dispatch failure with error payload
+                     this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: { code: -32001, message: 'Unexpected response structure' } });
+                }
+            } else {
+                 console.error(`[Orchestrator] Received invalid or mismatched response for Call ID ${currentCallId}:`, responseData);
+                 // Dispatch failure with error payload
+                 this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: { code: -32002, message: 'Invalid or mismatched response ID' } });
+            }
+
+        } catch (error: any) {
+            console.error(`[Orchestrator] HTTP Error executing Step ${stepIndex + 1} (Call ID: ${currentCallId}):`, error.message);
+             // Check if session still exists
+            if (!this.session) { 
+                console.warn(`[Orchestrator] Session ended before HTTP error could be processed for Call ID ${currentCallId}.`);
+                return;
+            }
+            // Map axios error or other errors to an FSM event
+            let mcpErrorCode = -32000; // Default server error
+            let mcpErrorMessage = 'HTTP request failed';
+            if (axios.isAxiosError(error)) {
+                mcpErrorMessage = error.response?.data?.error?.message || error.message;
+                mcpErrorCode = error.response?.data?.error?.code || (error.code === 'ECONNABORTED' ? -32003 : -32000); // Map timeout
+            } else if (error instanceof Error) {
+                mcpErrorMessage = error.message;
+            }
+            // Dispatch failure with error payload
+            this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: { code: mcpErrorCode, message: mcpErrorMessage } });
+        }
+        
+        // Handle state change triggered by the dispatch above
+        if (this.session) {
+            this.handleStateChange(this.session.fsm.getCurrentState(), this.session.fsm.getContext());
+        }
     }
 
     // Resets the session state

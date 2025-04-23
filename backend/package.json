@@ -12,6 +12,7 @@
   "dependencies": {
     "@types/eventsource": "^1.1.15",
     "@types/ws": "^8.18.1",
+    "axios": "^1.8.4",
     "cors": "^2.8.5",
     "eventsource": "^3.0.6",
     "express": "^4.19.2",
