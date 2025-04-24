@@ -4,7 +4,7 @@ import { Stream } from 'openai/streaming';
 // Define the structure for an MCP tool call based on spec.md
 // We might need to refine this based on actual Playwright-MCP requirements
 interface McpToolCall {
-    tool_name: 'browser_navigate' | 'browser_search' | 'browser_click' | 'browser_type' | 'scroll' | 'assert_text' | 'browser_handle_dialog';
+    tool_name: 'navigate' | 'search' | 'click' | 'type' | 'scroll' | 'assert_text' | 'dismiss_modal';
     arguments: { [key: string]: any };
     tool_call_id?: string; // Added for potential OpenAI response mapping
 }
@@ -27,7 +27,7 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
         {
             type: 'function',
             function: {
-                name: 'browser_navigate',
+                name: 'navigate',
                 description: 'Navigate the browser to a specific URL.',
                 parameters: {
                     type: 'object',
@@ -41,7 +41,7 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
         {
             type: 'function',
             function: {
-                name: 'browser_search',
+                name: 'search',
                 description: 'Perform a search on the page using a query and optional selector.',
                 parameters: {
                     type: 'object',
@@ -56,7 +56,7 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
         {
             type: 'function',
             function: {
-                name: 'browser_click',
+                name: 'click',
                 description: 'Click on an element identified by a CSS selector or reference.',
                 parameters: {
                     type: 'object',
@@ -71,7 +71,7 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
         {
              type: 'function',
              function: {
-                name: 'browser_type',
+                name: 'type',
                 description: 'Type text into an input field identified by reference.',
                 parameters: {
                     type: 'object',
@@ -118,7 +118,7 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
         {
              type: 'function',
              function: {
-                name: 'browser_handle_dialog',
+                name: 'dismiss_modal',
                 description: 'Attempt to automatically dismiss any detected modal dialog or pop-up by accepting or dismissing it.',
                  parameters: {
                     type: 'object',
@@ -134,7 +134,7 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
         const stream: Stream<OpenAI.Chat.Completions.ChatCompletionChunk> = await openai.chat.completions.create({
             model: 'gpt-4-turbo',
             messages: [
-                { role: 'system', content: 'You are a web automation assistant. Convert the user\'s instruction into a sequence of tool calls based on the available tools. Generate a maximum of 10 steps. Use the tool names starting with \'browser_\'. For click and type actions, prioritize using the \'ref\' and \'element\' parameters based on accessibility snapshots when available.' },
+                { role: 'system', content: 'You are a web automation assistant. Convert the user\'s instruction into a sequence of tool calls based on the available tools (navigate, click, type, search, scroll, assert_text, dismiss_modal). Generate a maximum of 10 steps. Use the exact tool names provided. For click and type actions, provide \'ref\' and \'element\' parameters based on accessibility snapshots when available.' },
                 { role: 'user', content: instruction },
             ],
             tools: tools,

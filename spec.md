@@ -25,11 +25,11 @@ The backend parses the request into **≤ 10 sequential steps**, confirms each
 ### 2.4 Supported Browser Actions (Initial Set)
 | Action | MCP Tool | Notes |
 |--------|----------|-------|
-| Navigate to URL | `browser_navigate` | Absolute or relative URL |
-| Perform a search | `browser_search` | Requires query; `ref` needed for input |
-| Click element | `browser_click` | Requires `ref` and `element` description |
-| Type into field | `browser_type` | Requires `ref`, `element`, `text`; `submit` optional |
-| Handle dialog | `browser_handle_dialog` | `accept` optional |
+| Navigate to URL | `navigate` | Absolute or relative URL |
+| Perform a search | `search` | Requires query & selector (needs `ref` mapping) |
+| Click element | `click` | Requires `ref` / `element` (target via snapshot) |
+| Type into field | `type` | Requires `ref` / `element`, `text`; `submit` optional |
+| Dismiss modal | `dismiss_modal` | Attempt to dismiss pop-up |
 
 ### 2.5 UI Behavior
 * Control UI (React) is separate from the browser window.  
@@ -80,9 +80,9 @@ The backend parses the request into **≤ 10 sequential steps**, confirms each
 
 | Scenario | Handling |
 |----------|----------|
-| Element not found | Playwright‑MCP returns `ELEMENT_NOT_FOUND` (via `browser_click`/`browser_type` error); backend retries twice, then halts |
+| Element not found | Playwright‑MCP likely returns error on POST response; backend retries twice, then halts |
 | Ambiguous command | Backend sends best‑guess `tool_call`; user confirmation required |
-| Tool‑call timeout | MCP returns `TIMEOUT`; counted as a retry |
+| Tool‑call timeout | MCP returns `TIMEOUT` (via POST response or internal timer); counted as a retry |
 | User inactivity | 2‑minute confirmation window → backend sends `CANCEL_SESSION` |
 | UI closed mid‑session | Backend closes MCP WS; server terminates browser |
 

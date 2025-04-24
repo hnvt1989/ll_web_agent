@@ -1,26 +1,28 @@
-version: '3.8'
+#version: '3.8'
 
 networks:
   automation-net:
     driver: bridge
 
 services:
-  playwright-mcp:
-    build:
-      context: .
-      dockerfile: mcp-server.Dockerfile
-    container_name: mcp-server # Explicit hostname for backend connection
-    # command: is now defined in the Dockerfile CMD
-    networks:
-      - automation-net
-    healthcheck:
-      # Guessing pnpm start runs a node process. May need adjustment.
-      test: ["CMD", "pgrep", "-f", "node"] 
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s # Allow more time for build steps if needed on first run
-    # Note: Port 59985 is internal to the Docker network, not exposed to host
+  # playwright-mcp:
+  #   build:
+  #     context: .
+  #     dockerfile: mcp-server.Dockerfile
+  #   container_name: mcp-server # Explicit hostname for backend connection
+  #   # command: is now defined in the Dockerfile CMD
+  #   networks:
+  #     - automation-net
+  #   ports:
+  #     - "59985:59985"   
+  #   healthcheck:
+  #     # Guessing pnpm start runs a node process. May need adjustment.
+  #     test: ["CMD", "pgrep", "-f", "node"] 
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #     start_period: 30s # Allow more time for build steps if needed on first run
+  #   # Note: Port 59985 is internal to the Docker network, not exposed to host
 
   backend:
     build:
@@ -32,16 +34,16 @@ services:
     environment:
       # Backend connects to MCP server via its container name on the Docker network
       # - MCP_SERVER_SSE_URL=http://mcp-server:59985/sse # Use SSE endpoint
-      - MCP_SERVER_BASE_URL=http://mcp-server:59985 # Base URL for POST calls
+      - MCP_SERVER_BASE_URL=http://host.docker.internal:59985 # Use host.docker.internal to reach host machine
       # Pass the OpenAI API Key from the .env file
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       # Add any other necessary backend environment variables here
       # - NODE_ENV=development
     networks:
       - automation-net
-    depends_on:
-      playwright-mcp:
-        condition: service_healthy
+    # depends_on:
+    #   playwright-mcp:
+    #     condition: service_healthy
 
   ui:
     build:

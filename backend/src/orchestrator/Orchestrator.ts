@@ -5,6 +5,9 @@ import { parseInstruction } from '../parser/parseInstruction';
 // Import the function to translate MCP messages to FSM events
 import { translateMcpMessageToEvent } from './events'; 
 import axios from 'axios';
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const EventSourceLib = require('eventsource');
+import EventSource from 'eventsource';
 
 // Define the structure for an MCP tool call (align with parser)
 interface McpToolCall {
@@ -12,6 +15,17 @@ interface McpToolCall {
     arguments: { [key: string]: any };
     tool_call_id?: string;
 }
+
+// Map logical tool names to MCP browser tool names
+const TOOL_NAME_MAP: Record<string, string> = {
+    navigate: 'browser_navigate',
+    search: 'browser_search',
+    click: 'browser_click',
+    type: 'browser_type',
+    scroll: 'browser_scroll',
+    assert_text: 'browser_assert_text',
+    dismiss_modal: 'browser_dismiss_modal'
+};
 
 // Define the structure for session data managed by the orchestrator
 interface SessionData {
@@ -21,72 +35,151 @@ interface SessionData {
 }
 
 export class Orchestrator {
-    private mcpClient: McpSseClient;
+    private mcpClient: McpSseClient | null = null;
     private session: SessionData | null = null;
     private mcpServerBaseUrl: string;
+    private sessionId: string | null = null; // Add state for sessionId
+    private sseUrl: string | null = null;
+    private rpcIdCounter: number = 1;
+    private endpointEs: EventSource | null = null;
 
+    // Make constructor async to handle session initialization
+    // Note: This might have implications if Orchestrator is instantiated synchronously elsewhere.
+    // Consider moving initialization to a separate async method if needed.
     constructor(mcpServerBaseUrl: string) {
         this.mcpServerBaseUrl = mcpServerBaseUrl;
-        this.mcpClient = this.initializeMcpClient();
-        // No initial session
+        // Session ID initialization now happens separately, maybe call initializeMcpSession() explicitly after construction?
+        // Or handle lazily before first call in executeStep? For simplicity, let's try lazy init in executeStep for now.
+    }
+    
+    // Async function to initialize the MCP session and get the ID via SSE 'endpoint' event
+    private async initializeMcpSession(): Promise<string | null> {
+        if (this.sessionId) {
+            return this.sessionId; // Already initialized
+        }
+
+        console.log(`[Orchestrator] Establishing endpoint SSE connection to ${this.mcpServerBaseUrl} to obtain sessionId...`);
+
+        return new Promise<string | null>((resolve, reject) => {
+            try {
+                // Use EventSource to connect to the base URL
+                const EsConstructor = EventSourceLib.EventSource;
+                this.endpointEs = new EsConstructor(this.mcpServerBaseUrl);
+
+                // Timeout safeguard (e.g., 60s)
+                const timeoutId = setTimeout(() => {
+                    console.error('[Orchestrator] Timeout waiting for endpoint event with sessionId.');
+                    this.endpointEs?.close();
+                    this.endpointEs = null;
+                    reject(new Error('Timeout waiting for sessionId'));
+                }, 60000);
+
+                // Listen for the custom SSE event named 'endpoint'
+                if (this.endpointEs) {
+                    this.endpointEs.addEventListener('endpoint', (ev: MessageEvent) => {
+                        try {
+                            const dataStr = (ev as any).data as string;
+                            if (typeof dataStr === 'string' && dataStr.startsWith('/sse?sessionId=')) {
+                                const sessionId = dataStr.split('sessionId=')[1];
+                                if (sessionId) {
+                                    clearTimeout(timeoutId);
+                                    this.sessionId = sessionId.trim();
+                                    this.sseUrl = `${this.mcpServerBaseUrl}${dataStr}`; // full URL for POST/SSE
+                                    console.log(`[Orchestrator] Obtained sessionId: ${this.sessionId}`);
+                                    resolve(this.sessionId);
+                                }
+                            }
+                        } catch (parseErr) {
+                            console.error('[Orchestrator] Failed parsing endpoint event:', parseErr);
+                        }
+                    });
+                }
+
+                if (this.endpointEs) {
+                    this.endpointEs.onerror = (err: any) => {
+                        clearTimeout(timeoutId);
+                        console.error('[Orchestrator] Error on endpoint SSE connection:', err);
+                        this.endpointEs?.close();
+                        this.endpointEs = null;
+                        reject(err);
+                    };
+                }
+            } catch (err) {
+                reject(err);
+            }
+        });
     }
 
-    private initializeMcpClient(): McpSseClient {
-        let sseUrl = this.mcpServerBaseUrl;
-        if (!sseUrl.endsWith('/')) {
-            sseUrl += '/';
+    // Create the SSE client after obtaining sessionId and send initialize RPC
+    private async createSseClient(): Promise<void> {
+        if (!this.sessionId) {
+            console.error('[Orchestrator] Cannot create SSE client: sessionId missing.');
+            return;
         }
-        sseUrl += 'sse'; 
-        
-        console.log(`[Orchestrator] Initializing SSE client for URL: ${sseUrl}`);
-        const client = new McpSseClient(sseUrl);
 
-        client.on('open', () => {
+        // Build SSE URL with sessionId as query param (no trailing /sse here, server expects /sse)
+        this.sseUrl = `${this.mcpServerBaseUrl}/sse?sessionId=${this.sessionId}`;
+
+        // Prepare initialize payload
+        const initPayload = {
+            jsonrpc: '2.0',
+            id: this.rpcIdCounter++,
+            method: 'initialize',
+            params: {
+                protocolVersion: '2024-05-01',
+                clientInfo: {
+                    name: 'll-web-agent-backend',
+                    version: '0.1.0'
+                },
+                capabilities: {
+                    tools: {},
+                    resources: {},
+                    logging: { levels: ['info', 'warn', 'error'] }
+                }
+            }
+        };
+
+        // Send initialize via POST to SSE endpoint
+        try {
+            console.log(`[Orchestrator] Sending initialize RPC to ${this.sseUrl}`);
+            await axios.post(this.sseUrl, initPayload, { headers: { 'Content-Type': 'application/json' }, timeout: 10000 });
+        } catch (error: any) {
+            console.error('[Orchestrator] Failed to send initialize RPC:', error.message);
+            return;
+        }
+
+        // Create SSE client instance once initialization succeeds
+        this.mcpClient = new McpSseClient(this.sseUrl);
+
+        this.mcpClient.on('open', () => {
             console.log('[Orchestrator] MCP SSE Client Connected.');
-            // Handle connection logic if needed (e.g., maybe reset state if disconnected mid-session)
         });
 
-        client.on('message', (message: McpMessage) => {
-            console.log('[Orchestrator] Received MCP message via SSE:', JSON.stringify(message));
-            // Note: Direct results/errors from calls made via executeStep (POST) are handled there.
-            // This handler should now primarily process asynchronous events initiated by the MCP server itself (if any).
+        this.mcpClient.on('message', (message: McpMessage) => {
             if (this.session) {
-                // Translate message to FSM event
                 const event = translateMcpMessageToEvent(message, this.session.fsm.getContext());
                 if (event) {
-                    console.log(`[Orchestrator] Dispatching FSM event from MCP message: ${event}`);
                     this.session.fsm.dispatch(event);
                     this.handleStateChange(this.session.fsm.getCurrentState(), this.session.fsm.getContext());
-                } else {
-                    console.log('[Orchestrator] MCP message did not translate to a relevant FSM event.');
                 }
-            } else {
-                console.log('[Orchestrator] Received MCP message but no active session.');
             }
         });
 
-        client.on('close', (event: Event) => {
-            console.log(`[Orchestrator] MCP SSE Client Closed. Event:`, event);
-            // Handle disconnection - maybe transition FSM to ERROR or IDLE if session active?
-            if (this.session && this.session.fsm.getCurrentState() !== OrchestratorState.IDLE) {
-                 console.warn('[Orchestrator] MCP SSE client disconnected during active session. Resetting to IDLE.');
-                 // Force state to IDLE - needs careful consideration of side effects
-                 this.resetSession(OrchestratorState.IDLE); 
+        this.mcpClient.on('close', () => {
+            console.log('[Orchestrator] MCP SSE Client Closed.');
+            if (this.session) {
+                this.resetSession(OrchestratorState.IDLE);
             }
         });
 
-        client.on('error', (error: Event) => {
-            console.error('[Orchestrator] MCP SSE Client Error:', error);
-            // Error handling, potentially dispatch ERROR to FSM or reset
-            if (this.session && this.session.fsm.getCurrentState() !== OrchestratorState.IDLE) {
-                 console.warn('[Orchestrator] MCP SSE client error during active session. Resetting to IDLE.');
-                 this.resetSession(OrchestratorState.ERROR); // Go to error state
+        this.mcpClient.on('error', (err: Event) => {
+            console.error('[Orchestrator] MCP SSE Client Error:', err);
+            if (this.session) {
+                this.resetSession(OrchestratorState.ERROR);
             }
         });
 
-        // Attempt initial connection
-        client.connect();
-        return client;
+        this.mcpClient.connect();
     }
 
     // Method to handle FSM state updates
@@ -131,6 +224,10 @@ export class Orchestrator {
         console.log(`[Orchestrator] Starting new session with instruction: "${instruction}"`);
         const fsm = new OrchestratorFsm(this.onStateUpdate.bind(this)); // Pass bound state update handler
         this.session = { fsm, steps: [], instruction }; 
+
+        // Ensure MCP session & SSE established upfront for new session
+        await this.initializeMcpSession();
+        await this.createSseClient();
 
         this.session.fsm.dispatch(OrchestratorEvent.RECEIVE_INSTRUCTION);
         // TODO: Notify UI
@@ -214,6 +311,24 @@ export class Orchestrator {
     // Executes the step via MCP Socket
     // Update to make async and use HTTP POST
     private async executeStep(stepIndex: number): Promise<void> { 
+        // --- Ensure Session ID is initialized --- 
+        const currentSessionId = await this.initializeMcpSession();
+        if (!currentSessionId) {
+             console.error("[Orchestrator] Cannot execute step: MCP session ID not available.");
+             if(this.session) {
+                // Dispatch error or handle appropriately
+                this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: { code: -32004, message: 'MCP session not initialized' } });
+                this.handleStateChange(this.session.fsm.getCurrentState(), this.session.fsm.getContext());
+            }
+             return;
+        }
+        // --- End Session ID Check ---
+        
+        // Ensure SSE client exists (may not yet if direct step execution triggered before startSession)
+        if (!this.mcpClient) {
+            await this.createSseClient();
+        }
+
         if (!this.session || stepIndex < 0 || stepIndex >= this.session.steps.length) {
             console.error(`[Orchestrator] Invalid stepIndex ${stepIndex} for execution.`);
             // Ensure session exists before dispatching
@@ -225,66 +340,90 @@ export class Orchestrator {
         }
 
         const stepToExecute = this.session.steps[stepIndex];
-        const currentCallId = Date.now(); // Generate unique ID for this call
-        console.log(`[Orchestrator] Executing Step ${stepIndex + 1}/${this.session.steps.length} (Call ID: ${currentCallId}):`, stepToExecute);
+        // Translate tool name if mapping exists
+        const mcpToolName = TOOL_NAME_MAP[stepToExecute.tool_name] ?? stepToExecute.tool_name;
+        const currentCallId = this.rpcIdCounter++;
+        console.log(`[Orchestrator] Executing Step ${stepIndex + 1}/${this.session.steps.length} (Ref ID: ${currentCallId}):`, stepToExecute);
 
-        // Format as an MCP 'call' message
+        /* // Standard MCP Format - commented out
         const callMessage: McpMessage = {
             type: 'call',
             id: currentCallId, 
             method: stepToExecute.tool_name,
             params: stepToExecute.arguments,
         };
+        */
+
+        // --- Format as JSON-RPC 2.0 Request --- 
+        const jsonRpcPayload = {
+            jsonrpc: "2.0",
+            id: currentCallId,
+            method: "tools/call",
+            params: {
+                name: mcpToolName,
+                arguments: stepToExecute.arguments
+            }
+        };
+
+        /* // Alternative {action: ...} format - commented out 
+        const altPayload = {
+            action: stepToExecute.tool_name, 
+            ...stepToExecute.arguments 
+        };
+        const commandUrl = this.mcpServerBaseUrl.endsWith('/') 
+                         ? `${this.mcpServerBaseUrl}command` 
+                         : `${this.mcpServerBaseUrl}/command`;
+        */
+
+        // Construct command URL with session ID
+        const commandUrl = this.sseUrl ?? `${this.mcpServerBaseUrl}/sse?sessionId=${currentSessionId}`;
 
         // Log the message being sent
-        console.log(`[Orchestrator] Sending MCP call via POST:`, JSON.stringify(callMessage, null, 2));
-
-        // Remove the SSE client send call
-        // this.mcpClient.send(callMessage);
+        console.log(`[Orchestrator] Sending JSON-RPC call via POST to ${commandUrl}:`, JSON.stringify(jsonRpcPayload, null, 2));
         
         // --- Send via HTTP POST --- 
         try {
-            // Use the base URL stored during construction. MCP calls are sent to the base endpoint.
-            const response = await axios.post<Result | McpError>(this.mcpServerBaseUrl, callMessage, {
-                headers: { 'Content-Type': 'application/json' },
-                timeout: 30000 // Example: 30 second timeout
-            });
+            // Post to the /command URL with the JSON-RPC payload
+            const response = await axios.post<any>( 
+                commandUrl, // Use command URL with session ID
+                jsonRpcPayload,
+                { 
+                    headers: { 'Content-Type': 'application/json' },
+                    timeout: 30000 
+                });
 
             const responseData = response.data;
             console.log(`[Orchestrator] Received HTTP response for Call ID ${currentCallId}:`, responseData);
 
-            // Check if session still exists (could have been cancelled while waiting)
+            // Check if session still exists 
             if (!this.session) { 
                 console.warn(`[Orchestrator] Session ended while awaiting response for Call ID ${currentCallId}. Ignoring response.`);
                 return;
             }
             
-            // Validate response structure and ID
+            // --- Restore Standard JSON-RPC Response Handling --- 
+            // Validate response structure and ID (JSON-RPC includes id in both success and error responses)
             if (responseData && typeof responseData === 'object' && responseData.id === currentCallId) {
-                if (responseData.type === 'result') {
+                if ('result' in responseData) { // Check for result property for success
                     console.log(`[Orchestrator] Step ${stepIndex + 1} completed successfully.`);
-                    // Check if it was the last step
                     const isLastStep = this.session.fsm.getContext().currentStepIndex >= this.session.fsm.getContext().totalSteps - 1;
                     const successEvent = isLastStep ? OrchestratorEvent.STEP_SUCCESS_LAST : OrchestratorEvent.STEP_SUCCESS_NEXT;
-                    // Dispatch correct event with result payload
                     this.session.fsm.dispatch(successEvent, { result: responseData.result });
-                } else if (responseData.type === 'error') {
-                    console.error(`[Orchestrator] Step ${stepIndex + 1} failed. MCP Error:`, responseData.error);
-                    // Dispatch failure with error payload
+                } else if ('error' in responseData) { // Check for error property
+                    console.error(`[Orchestrator] Step ${stepIndex + 1} failed. JSON-RPC Error:`, responseData.error);
                     this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: responseData.error });
                 } else {
-                     console.error(`[Orchestrator] Received unexpected response structure for Call ID ${currentCallId}:`, responseData);
-                     // Dispatch failure with error payload
-                     this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: { code: -32001, message: 'Unexpected response structure' } });
+                     console.error(`[Orchestrator] Received unexpected JSON-RPC response structure for Call ID ${currentCallId}:`, responseData);
+                     this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: { code: -32001, message: 'Unexpected JSON-RPC response structure' } });
                 }
             } else {
-                 console.error(`[Orchestrator] Received invalid or mismatched response for Call ID ${currentCallId}:`, responseData);
-                 // Dispatch failure with error payload
+                 console.error(`[Orchestrator] Received invalid or mismatched response ID for Call ID ${currentCallId}:`, responseData);
                  this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: { code: -32002, message: 'Invalid or mismatched response ID' } });
             }
+            
 
         } catch (error: any) {
-            console.error(`[Orchestrator] HTTP Error executing Step ${stepIndex + 1} (Call ID: ${currentCallId}):`, error.message);
+            console.error(`[Orchestrator] HTTP Error executing Step ${stepIndex + 1} (Call ID: ${currentCallId}) via ${commandUrl}:`, error.message);
              // Check if session still exists
             if (!this.session) { 
                 console.warn(`[Orchestrator] Session ended before HTTP error could be processed for Call ID ${currentCallId}.`);
@@ -317,6 +456,12 @@ export class Orchestrator {
              this.session.fsm.clearConfirmationTimer?.(); // Add this method to FSM if needed
          }
         this.session = null;
+        if (this.mcpClient) {
+            this.mcpClient.disconnect();
+            this.mcpClient = null;
+        }
+        this.sessionId = null;
+        this.sseUrl = null;
         // TODO: Notify UI that session ended/reset
     }
 
