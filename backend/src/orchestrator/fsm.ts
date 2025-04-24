@@ -37,7 +37,7 @@ export interface FsmContext {
 }
 
 // Configuration constants
-export const MAX_RETRIES = 2;
+export const MAX_RETRIES = 0;
 export const CONFIRMATION_TIMEOUT_MS = 120000; // 120 seconds
 
 /**

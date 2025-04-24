@@ -112,6 +112,10 @@ export class Orchestrator {
 
     // Create the SSE client after obtaining sessionId and send initialize RPC
     private async createSseClient(): Promise<void> {
+        if (this.mcpClient) {
+            return; // already created
+        }
+
         if (!this.sessionId) {
             console.error('[Orchestrator] Cannot create SSE client: sessionId missing.');
             return;
@@ -311,30 +315,21 @@ export class Orchestrator {
     // Executes the step via MCP Socket
     // Update to make async and use HTTP POST
     private async executeStep(stepIndex: number): Promise<void> { 
-        // --- Ensure Session ID is initialized --- 
-        const currentSessionId = await this.initializeMcpSession();
-        if (!currentSessionId) {
-             console.error("[Orchestrator] Cannot execute step: MCP session ID not available.");
-             if(this.session) {
-                // Dispatch error or handle appropriately
+        // Ensure we have active session and SSE client (set up in startSession)
+        if (!this.sessionId || !this.mcpClient) {
+            console.error('[Orchestrator] Cannot execute step: missing active MCP session.');
+            if (this.session) {
                 this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: { code: -32004, message: 'MCP session not initialized' } });
-                this.handleStateChange(this.session.fsm.getCurrentState(), this.session.fsm.getContext());
             }
-             return;
-        }
-        // --- End Session ID Check ---
-        
-        // Ensure SSE client exists (may not yet if direct step execution triggered before startSession)
-        if (!this.mcpClient) {
-            await this.createSseClient();
+            return;
         }
 
+        const currentSessionId = this.sessionId;
         if (!this.session || stepIndex < 0 || stepIndex >= this.session.steps.length) {
             console.error(`[Orchestrator] Invalid stepIndex ${stepIndex} for execution.`);
             // Ensure session exists before dispatching
             if(this.session) { 
                 this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED); 
-                this.handleStateChange(this.session.fsm.getCurrentState(), this.session.fsm.getContext());
             }
             return;
         }
@@ -401,24 +396,26 @@ export class Orchestrator {
                 return;
             }
             
-            // --- Restore Standard JSON-RPC Response Handling --- 
-            // Validate response structure and ID (JSON-RPC includes id in both success and error responses)
-            if (responseData && typeof responseData === 'object' && responseData.id === currentCallId) {
-                if ('result' in responseData) { // Check for result property for success
-                    console.log(`[Orchestrator] Step ${stepIndex + 1} completed successfully.`);
+            // If server returns 202 or plain "Accepted", treat as acknowledgement and wait for SSE result
+            if (response.status === 202 || (typeof responseData === 'string' && responseData.toLowerCase().includes('accepted'))) {
+                console.log(`[Orchestrator] Call ID ${currentCallId} acknowledged by MCP server, awaiting RESULT over SSE.`);
+                // Do not change FSM state here; success/failure handled when RESULT/ERROR message arrives via SSE
+            } else if (responseData && typeof responseData === 'object' && responseData.id === currentCallId) {
+                if ('result' in responseData) {
+                    console.log(`[Orchestrator] Step ${stepIndex + 1} completed synchronously.`);
                     const isLastStep = this.session.fsm.getContext().currentStepIndex >= this.session.fsm.getContext().totalSteps - 1;
                     const successEvent = isLastStep ? OrchestratorEvent.STEP_SUCCESS_LAST : OrchestratorEvent.STEP_SUCCESS_NEXT;
                     this.session.fsm.dispatch(successEvent, { result: responseData.result });
-                } else if ('error' in responseData) { // Check for error property
-                    console.error(`[Orchestrator] Step ${stepIndex + 1} failed. JSON-RPC Error:`, responseData.error);
+                } else if ('error' in responseData) {
+                    console.error(`[Orchestrator] Step ${stepIndex + 1} failed synchronously. JSON-RPC Error:`, responseData.error);
                     this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: responseData.error });
                 } else {
-                     console.error(`[Orchestrator] Received unexpected JSON-RPC response structure for Call ID ${currentCallId}:`, responseData);
-                     this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: { code: -32001, message: 'Unexpected JSON-RPC response structure' } });
+                    console.error(`[Orchestrator] Unexpected JSON-RPC response structure for Call ID ${currentCallId}:`, responseData);
+                    this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: { code: -32001, message: 'Unexpected JSON-RPC response structure' } });
                 }
             } else {
-                 console.error(`[Orchestrator] Received invalid or mismatched response ID for Call ID ${currentCallId}:`, responseData);
-                 this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: { code: -32002, message: 'Invalid or mismatched response ID' } });
+                console.error(`[Orchestrator] Invalid or mismatched response for Call ID ${currentCallId}:`, responseData);
+                // Do not treat as fatal; wait for SSE result.
             }
             
 
@@ -440,11 +437,6 @@ export class Orchestrator {
             }
             // Dispatch failure with error payload
             this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: { code: mcpErrorCode, message: mcpErrorMessage } });
-        }
-        
-        // Handle state change triggered by the dispatch above
-        if (this.session) {
-            this.handleStateChange(this.session.fsm.getCurrentState(), this.session.fsm.getContext());
         }
     }
 
