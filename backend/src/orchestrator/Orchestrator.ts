@@ -1,227 +1,82 @@
-import { OrchestratorFsm, OrchestratorState, OrchestratorEvent, FsmContext } from './fsm';
-import { McpSseClient } from '../mcp/socket';
-import { McpMessage, Result, Error as McpError } from '../types/mcp';
-import { parseInstruction } from '../parser/parseInstruction';
-// Import the function to translate MCP messages to FSM events
-import { translateMcpMessageToEvent, isJsonRpcSuccess, isJsonRpcError } from './events'; 
+// backend/src/orchestrator/Orchestrator.ts
 import axios from 'axios';
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const EventSourceLib = require('eventsource');
-import EventSource from 'eventsource';
+import { OrchestratorFsm, OrchestratorState, OrchestratorEvent, FsmContext } from './fsm';
+import * as EventSourceLib from 'eventsource';
+import { parseInstruction } from '../parser/parseInstruction';
+import { refineStepArgumentsWithSnapshot } from '../parser/refineStepArguments';
+import { Call } from '../types/mcp';
+// import logger from '../utils/logger';
 
-// Define the structure for an MCP tool call (align with parser)
-interface McpToolCall {
+// Define the structure for parsed tool call steps used internally
+export interface McpToolCall { // Exported for fsm.ts
     tool_name: string;
     arguments: { [key: string]: any };
-    tool_call_id?: string;
+    tool_call_id?: string; // Optional ID from parser or unique internal ID
+}
+
+// Define the structure for MCP tool definitions
+interface McpToolDefinition {
+    name: string;
+    description?: string;
+    inputSchema: any; // Ideally, use a more specific JSON schema type
 }
 
 // Define the structure for session data managed by the orchestrator
 interface SessionData {
     fsm: OrchestratorFsm;
-    steps: McpToolCall[];
+    steps: McpToolCall[]; // This list might be updated with refined steps
     instruction: string | null;
-    latestSnapshot?: string; // Store the latest snapshot HTML content
+    latestSnapshot: string | null; // Renamed from latestSnapshot for clarity
 }
 
-// Define a reference entry structure for temporary use
-interface RefEntry {
-    ref: string;
-    element: string;
-    text: string;
-}
-
+// Define the Orchestrator class
 export class Orchestrator {
-    private mcpClient: McpSseClient | null = null;
-    private session: SessionData | null = null;
     private mcpServerBaseUrl: string;
-    private sessionId: string | null = null; // Add state for sessionId
+    private endpointEs: EventSourceLib.EventSource | null = null;
+    private sessionId: string | null = null;
     private sseUrl: string | null = null;
-    private rpcIdCounter: number = 1;
-    private endpointEs: EventSource | null = null;
-    private dynamicToolMap: Record<string,string> = {};
+    private session: SessionData | null = null;
+    private rpcIdCounter = 1;
+    private dynamicToolMap: { [key: string]: string } = {};
+    private confirmationTimerId: NodeJS.Timeout | null = null; // Timer ID management
+    private static readonly CONFIRMATION_TIMEOUT_MS = 120000; // 2 minutes
 
-    // Make constructor async to handle session initialization
-    // Note: This might have implications if Orchestrator is instantiated synchronously elsewhere.
-    // Consider moving initialization to a separate async method if needed.
     constructor(mcpServerBaseUrl: string) {
         this.mcpServerBaseUrl = mcpServerBaseUrl;
-        // Session ID initialization now happens separately, maybe call initializeMcpSession() explicitly after construction?
-        // Or handle lazily before first call in executeStep? For simplicity, let's try lazy init in executeStep for now.
-    }
-    
-    // Extract references from a snapshot
-    private extractReferencesFromSnapshot(snapshotResult: any): RefEntry[] {
-        console.log('[Orchestrator] Extracting references from snapshot...');
-        const references: RefEntry[] = [];
-        
-        if (!snapshotResult || typeof snapshotResult !== 'object') {
-            console.warn('[Orchestrator] No valid snapshot result to extract references from');
-            return references;
-        }
-
-        // Get the HTML content from the snapshot
-        const htmlContent = snapshotResult.html || snapshotResult.content || '';
-        if (!this.session) {
-            console.warn('[Orchestrator] No active session to store snapshot content');
-            return references;
-        }
-        
-        // Store the latest snapshot in the session
-        this.session.latestSnapshot = htmlContent;
-        
-        if (typeof htmlContent === 'string') {
-            // Log a sample of the content for debugging
-            const contentSample = htmlContent.length > 200 ? 
-                htmlContent.substring(0, 200) + '...' : htmlContent;
-            console.log(`[Orchestrator] Processing snapshot content (sample): ${contentSample}`);
-            
-            // Try multiple regex patterns to extract references
-            this.extractReferencesWithPattern(htmlContent, /["']([^"']+)["']\s*\[ref=([^\]]+)\]/g, references);
-            this.extractReferencesWithPattern(htmlContent, /([^\s"'\[]+)\s*\[ref=([^\]]+)\]/g, references);
-            this.extractReferencesWithPattern(htmlContent, /<[^>]+ref="([^"]+)"[^>]*>([^<]+)</g, references, true);
-            
-            console.log(`[Orchestrator] Extracted ${references.length} references from snapshot`);
-            if (references.length > 0) {
-                console.log('[Orchestrator] References:', references.map(r => 
-                    `ref=${r.ref}, element=${r.element}, text="${r.text}"`).join(' | '));
-            } else {
-                console.warn('[Orchestrator] No references found in snapshot content');
-            }
-        }
-        
-        return references;
-    }
-    
-    // Helper to extract references using a specific regex pattern
-    private extractReferencesWithPattern(
-        content: string, 
-        pattern: RegExp, 
-        references: RefEntry[], 
-        swapGroups: boolean = false
-    ): void {
-        let match;
-        
-        while ((match = pattern.exec(content)) !== null) {
-            const textIdx = swapGroups ? 2 : 1;
-            const refIdx = swapGroups ? 1 : 2;
-            
-            const text = match[textIdx].trim();
-            const ref = match[refIdx].trim();
-            
-            // Try to determine the element type
-            let element = 'element'; // Default
-            if (content.includes(`<button`) && content.includes(text)) {
-                element = 'button';
-            } else if (content.includes(`<a`) && content.includes(text)) {
-                element = 'link';
-            } else if (content.includes(`<input`) && content.includes(text)) {
-                element = 'input';
-            } else if (content.includes(`<li`) && content.includes(text)) {
-                element = 'listitem';
-            }
-            
-            references.push({ ref, element, text });
-            console.log(`[Orchestrator] Extracted reference: ref=${ref}, element=${element}, text="${text}"`);
-        }
-    }
-    
-    // Process tool response to extract references if it's a snapshot
-    private processToolResponse(responseData: any, toolName: string): void {
-        console.log(`[Orchestrator] Processing response for tool: ${toolName}`);
-        
-        if (toolName === 'browser_snapshot' && responseData && responseData.result) {
-            this.extractReferencesFromSnapshot(responseData.result);
-        }
-    }
-    
-    // Complete arguments with references from the latest snapshot
-    private completeArgumentsWithRefs(toolName: string, args: any): any {
-        // Don't modify arguments for snapshot tool
-        if (toolName === 'browser_snapshot' || !this.session || !this.session.latestSnapshot) {
-            return args;
-        }
-        
-        // For click or type operations, try to supply missing ref or element info
-        const updatedArgs = { ...args };
-        
-        // If reference is set to <UNKNOWN>, treat it as missing
-        if (updatedArgs.ref === '<UNKNOWN>') {
-            console.log(`[Orchestrator] Found placeholder <UNKNOWN> ref, will attempt to find a real reference`);
-            delete updatedArgs.ref;
-        }
-        
-        // If element is specified but ref is missing, try to find matching element in the latest snapshot
-        if (!updatedArgs.ref && updatedArgs.element && this.session.latestSnapshot) {
-            console.log(`[Orchestrator] Trying to find ref for element: "${updatedArgs.element}"`);
-            
-            // Extract all references from the latest snapshot
-            const references = this.extractReferencesFromSnapshot({ content: this.session.latestSnapshot });
-            
-            // Get all possible matching entries using flexible matching
-            const matchingEntries = references.filter(entry => {
-                // Direct match on element type
-                if (entry.element === updatedArgs.element) {
-                    console.log(`[Orchestrator] Found direct element type match: ${entry.element}`);
-                    return true;
-                }
-                
-                // Check if entry text contains the element text or vice versa
-                if (entry.text && updatedArgs.element) {
-                    const entryText = entry.text.toLowerCase();
-                    const argText = updatedArgs.element.toLowerCase();
-                    
-                    if (entryText.includes(argText) || argText.includes(entryText)) {
-                        console.log(`[Orchestrator] Found text match: "${entry.text}" contains/is contained in "${updatedArgs.element}"`);
-                        return true;
-                    }
-                    
-                    // Check for word-level matches
-                    const entryWords = entryText.split(/\s+/);
-                    const argWords = argText.split(/\s+/);
-                    
-                    const commonWords = entryWords.filter(word => argWords.includes(word));
-                    if (commonWords.length > 0) {
-                        console.log(`[Orchestrator] Found word-level match: common words ${commonWords.join(', ')}`);
-                        return true;
-                    }
-                }
-                
-                return false;
-            });
-            
-            if (matchingEntries.length > 0) {
-                // Just use the first matching entry for simplicity
-                updatedArgs.ref = matchingEntries[0].ref;
-                console.log(`[Orchestrator] Found ref for element ${updatedArgs.element}: ${updatedArgs.ref}`);
-            } else {
-                console.warn(`[Orchestrator] No matching reference found for element: "${updatedArgs.element}"`);
-            }
-        }
-        
-        // Remove <UNKNOWN> refs if we couldn't find a valid replacement
-        if (updatedArgs.ref === '<UNKNOWN>') {
-            console.log(`[Orchestrator] Removing placeholder <UNKNOWN> ref as no valid reference was found`);
-            delete updatedArgs.ref;
-        }
-        
-        return updatedArgs;
     }
 
-    // Initializes session: gets sessionId via 'endpoint' event AND tools via async tools/list response ON THE SAME endpoint stream.
-    private async initializeMcpSession(): Promise<{ sessionId: string; toolsList: any[] | undefined }> {
-        if (this.sessionId) {
-            // Assuming if sessionId exists, tools were likely fetched too. If not, this might need adjustment.
+    private resetSession(finalState?: OrchestratorState): void {
+        // logger.info(`[Orchestrator] Resetting session. Final state: ${finalState ?? 'Unknown'}`);
+        console.log(`[Orchestrator] Resetting session. Final state: ${finalState ?? 'Unknown'}`);
+        this.clearConfirmationTimer(); // Clear timer on session reset
+        this.endpointEs?.close();
+        this.endpointEs = null;
+        this.sessionId = null;
+        this.sseUrl = null;
+        this.session = null; // Crucially, clear the session object
+        this.rpcIdCounter = 1;
+        this.dynamicToolMap = {};
+        // TODO: Notify UI about session reset more explicitly if needed
+    }
+
+    /**
+     * Initializes the connection with the MCP server, fetches tools, and gets a session ID.
+     * (Implementation remains largely the same as before, focuses on setup)
+     */
+    private async initializeMcpSession(): Promise<{ sessionId: string; toolsList: McpToolDefinition[] | undefined }> {
+        if (this.sessionId && this.endpointEs) {
+            // logger.warn('[Orchestrator] Session already initialized.');
             console.warn('[Orchestrator] Session already initialized.');
-            // For simplicity, we don't re-fetch tools here. Consider if needed.
-            return { sessionId: this.sessionId, toolsList: Object.values(this.dynamicToolMap) };
+            const toolsFromMap = Object.keys(this.dynamicToolMap).map(name => ({ name, inputSchema: {} }));
+            return { sessionId: this.sessionId, toolsList: toolsFromMap.length > 0 ? toolsFromMap : undefined };
         }
 
         return new Promise((resolve, reject) => {
+            // logger.info(`[Orchestrator] Establishing endpoint SSE to ${this.mcpServerBaseUrl} for sessionId & tools...`);
             console.log(`[Orchestrator] Establishing endpoint SSE to ${this.mcpServerBaseUrl} for sessionId & tools...`);
             let receivedSessionId = false;
             let receivedToolsList = false;
-            let toolsListResult: any[] | undefined = undefined;
+            let toolsListResult: McpToolDefinition[] | undefined = undefined;
             let toolsListReqId: number | null = null;
             let localSessionId: string | null = null;
             let localSseUrl: string | null = null;
@@ -231,34 +86,49 @@ export class Orchestrator {
 
             const checkCompletion = () => {
                 if (receivedSessionId && receivedToolsList) {
+                    // logger.info('[Orchestrator] Received both sessionId and tools/list response.');
                     console.log('[Orchestrator] Received both sessionId and tools/list response.');
-                    // Don't close endpointEs here, server might send other things?
-                    if(timeoutId) clearTimeout(timeoutId);
+                    if (timeoutId) clearTimeout(timeoutId);
+                    if (toolsListResult && Array.isArray(toolsListResult)) {
+                        this.dynamicToolMap = toolsListResult.reduce((map, tool) => {
+                            if (tool && typeof tool.name === 'string') { map[tool.name] = tool.name; }
+                            return map;
+                        }, {} as Record<string, string>);
+                        // logger.info('[Orchestrator] Dynamic tool map populated:', this.dynamicToolMap);
+                        console.log('[Orchestrator] Dynamic tool map populated:', this.dynamicToolMap);
+                    } else {
+                        // logger.warn('[Orchestrator] Tools list not available after session init.');
+                        console.warn('[Orchestrator] Tools list not available after session init.');
+                        this.dynamicToolMap = {};
+                    }
                     resolve({ sessionId: localSessionId!, toolsList: toolsListResult });
                 }
             };
 
             const failSession = (err: any) => {
-                console.error('[Orchestrator] Failed during initial session setup:', err);
-                if(timeoutId) clearTimeout(timeoutId);
+                // logger.error({ err: err }, '[Orchestrator] Failed during initial session setup:');
+                console.error('[Orchestrator] Failed during initial session setup:', { err: err });
+                if (timeoutId) clearTimeout(timeoutId);
                 this.endpointEs?.close();
                 this.endpointEs = null;
                 this.sessionId = null;
                 this.sseUrl = null;
+                this.dynamicToolMap = {};
                 reject(err);
             };
 
-            const timeoutId = setTimeout(() => failSession(new Error('Timeout waiting for sessionId and/or tools/list response')), 20000); // 20s overall timeout
+            const timeoutId = setTimeout(() => failSession(new Error('Timeout waiting for sessionId and/or tools/list response')), 20000);
 
-            // Listener for Session ID
             if (!this.endpointEs) return failSession('Endpoint EventSource is null before addEventListener');
-            this.endpointEs.addEventListener('endpoint', (ev: MessageEvent) => {
-                if (receivedSessionId) return; // Already got it
-                try {
+
+            this.endpointEs.addEventListener('endpoint', (ev) => {
+                 if (receivedSessionId) return;
+                 try {
                     const dataStr = (ev as any).data as string;
                     if (typeof dataStr === 'string' && dataStr.startsWith('/sse?sessionId=')) {
                         const sessionId = dataStr.split('sessionId=')[1]?.trim();
                         if (sessionId) {
+                            // logger.info(`[Orchestrator] Obtained sessionId: ${sessionId}`);
                             console.log(`[Orchestrator] Obtained sessionId: ${sessionId}`);
                             localSessionId = sessionId;
                             localSseUrl = `${this.mcpServerBaseUrl}${dataStr}`;
@@ -266,68 +136,129 @@ export class Orchestrator {
                             this.sseUrl = localSseUrl;
                             receivedSessionId = true;
 
+                            // --- Attach General Message Handler for MCP Responses ---
+                            // logger.info(`[Orchestrator] Attaching general message handler to ${localSseUrl}`);
+                            console.log(`[Orchestrator] Attaching general message handler to ${localSseUrl}`);
+                            this.endpointEs!.addEventListener('message', (msgEvent) => {
+                                try {
+                                    const msgData = JSON.parse((msgEvent as any).data);
+                                    // logger.info(`[Orchestrator] Received SSE message:`, JSON.stringify(msgData));
+                                    console.log(`[Orchestrator] Received SSE message:`, JSON.stringify(msgData));
+
+                                    if (msgData.jsonrpc === '2.0' && msgData.id !== undefined) {
+                                        // It's a JSON-RPC response related to a step execution
+                                        const isError = this.isJsonRpcError(msgData);
+                                        const responsePayload = {
+                                            stepId: msgData.id,
+                                            snapshot: undefined as string | undefined,
+                                            error: isError ? msgData.error : null,
+                                        };
+
+                                        if (!isError && this.isJsonRpcSuccess(msgData)) {
+                                            const result = msgData.result;
+                                             // Check if MCP result indicates an operational error
+                                            if (result?.isError === true) {
+                                                // logger.error({ err: result.content }, `[Orchestrator] Step Execution Error (ID: ${msgData.id}):`);
+                                                console.error(`[Orchestrator] Step Execution Error (ID: ${msgData.id}):`, { err: result.content });
+                                                responsePayload.error = { message: result.content || 'Step failed with isError=true', code: -32000 }; // Use generic code
+                                            } else {
+                                                // Look for snapshot embedded in 'text' type content
+                                                const textContentItem = result?.content?.find((item: any) => item.type === 'text');
+                                                if (textContentItem && textContentItem.text?.includes('- Page Snapshot')) {
+                                                    responsePayload.snapshot = textContentItem.text;
+                                                    // logger.info('[Orchestrator] Found snapshot in MCP response.');
+                                                    console.log('[Orchestrator] Found snapshot in MCP response.');
+                                                } else {
+                                                     // Set to undefined if not found, aligning with type
+                                                     responsePayload.snapshot = undefined; 
+                                                     // logger.info('[Orchestrator] No snapshot found in MCP response text.');
+                                                     console.log('[Orchestrator] No snapshot found in MCP response text.');
+                                                }
+                                            }
+                                        } else if (isError) {
+                                             // logger.error({ err: msgData.error }, `[Orchestrator] Received JSON-RPC Error (ID: ${msgData.id}):`);
+                                             console.error(`[Orchestrator] Received JSON-RPC Error (ID: ${msgData.id}):`, { err: msgData.error });
+                                        }
+
+                                        // Dispatch MCP_RESPONSE_RECEIVED to FSM
+                                        // Check if session and FSM still exist before dispatching
+                                        if (this.session?.fsm) {
+                                             // logger.info(`[Orchestrator] Dispatching MCP_RESPONSE_RECEIVED to FSM for ID: ${msgData.id}`);
+                                             console.log(`[Orchestrator] Dispatching MCP_RESPONSE_RECEIVED to FSM for ID: ${msgData.id}`);
+                                             this.session.fsm.dispatch(OrchestratorEvent.MCP_RESPONSE_RECEIVED, responsePayload);
+                                        } else {
+                                             // logger.warn(`[Orchestrator] Received MCP response (ID: ${msgData.id}) but no active session/FSM to dispatch to.`);
+                                             console.warn(`[Orchestrator] Received MCP response (ID: ${msgData.id}) but no active session/FSM to dispatch to.`);
+                                        }
+
+                                    } else {
+                                        // logger.warn('[Orchestrator] Received non-JSON-RPC SSE message or message without ID:', msgData);
+                                        console.warn('[Orchestrator] Received non-JSON-RPC SSE message or message without ID:', msgData);
+                                    }
+                                } catch (parseError: any) {
+                                    // logger.error({ err: parseError, data: (msgEvent as any).data }, '[Orchestrator] Error parsing SSE message data:');
+                                    console.error('[Orchestrator] Error parsing SSE message data:', { err: parseError, data: (msgEvent as any).data });
+                                }
+                            });
+                            // --- End General Message Handler ---
+
                             // Immediately request tools list
                             toolsListReqId = this.rpcIdCounter++;
+                            // logger.info(`[Orchestrator] Sending tools/list request (ID: ${toolsListReqId}) via POST to ${localSseUrl}...`);
                             console.log(`[Orchestrator] Sending tools/list request (ID: ${toolsListReqId}) via POST to ${localSseUrl}...`);
-                            axios.post(localSseUrl!, {
-                                jsonrpc: '2.0',
-                                id: toolsListReqId,
-                                method: 'tools/list',
-                                params: {}
-                            }, { headers: { 'Content-Type': 'application/json' }, timeout: 10000 })
-                            .then(response => {
-                                // Check for sync response or acknowledgement
-                                if (isJsonRpcSuccess(response.data) && response.data.id === toolsListReqId) {
-                                    console.log('[Orchestrator] tools/list responded synchronously (unexpected). Processing result...');
-                                    toolsListResult = response.data.result?.tools;
-                                    receivedToolsList = true;
-                                    checkCompletion();
-                                } else if (response.status === 202 || (typeof response.data === 'string' && response.data.toLowerCase().includes('accepted'))) {
-                                     console.log(`[Orchestrator] tools/list (ID: ${toolsListReqId}) acknowledged. Waiting on endpointEs stream...`);
-                                     // Result expected via message listener below
-                                } else {
-                                     console.warn('[Orchestrator] Unexpected sync response for tools/list:', response.data);
-                                     receivedToolsList = true; // Mark as done, but with no tools
-                                     checkCompletion();
-                                }
-                            })
-                            .catch(postError => {
-                                // Failure to POST the tools/list request is critical
-                                console.error('[Orchestrator] CRITICAL: Failed to POST tools/list request:', postError.message);
-                                failSession(postError); // Reject the main session promise
-                                // No need to set receivedToolsList = true here, failSession handles it.
-                                checkCompletion();
-                            });
-
-                            checkCompletion();
+                            axios.post(localSseUrl!, { jsonrpc: '2.0', id: toolsListReqId, method: 'tools/list', params: {} },
+                                { headers: { 'Content-Type': 'application/json' }, timeout: 10000 })
+                                .then(response => {
+                                    if (this.isJsonRpcSuccess(response.data) && response.data.id === toolsListReqId) {
+                                        // logger.info('[Orchestrator] tools/list responded synchronously. Processing result...');
+                                        console.log('[Orchestrator] tools/list responded synchronously. Processing result...');
+                                        toolsListResult = response.data.result?.tools;
+                                        receivedToolsList = true;
+                                        checkCompletion();
+                                    } else if (response.status === 202 || (typeof response.data === 'string' && response.data.toLowerCase().includes('accepted'))) {
+                                        // logger.info(`[Orchestrator] tools/list (ID: ${toolsListReqId}) acknowledged. Waiting on endpointEs stream...`);
+                                        console.log(`[Orchestrator] tools/list (ID: ${toolsListReqId}) acknowledged. Waiting on endpointEs stream...`);
+                                    } else {
+                                        // logger.warn('[Orchestrator] Unexpected sync response for tools/list:', response.data);
+                                        console.warn('[Orchestrator] Unexpected sync response for tools/list:', response.data);
+                                        receivedToolsList = true; checkCompletion();
+                                    }
+                                })
+                                .catch(postError => {
+                                    // logger.error({ err: postError }, '[Orchestrator] CRITICAL: Failed to POST tools/list request:');
+                                    console.error('[Orchestrator] CRITICAL: Failed to POST tools/list request:', { err: postError });
+                                    failSession(postError);
+                                });
+                            checkCompletion(); // Check if session ID was already received
                         }
-                    }
-                } catch (parseErr) {
-                    console.error('[Orchestrator] Error parsing endpoint event:', parseErr);
-                }
+                     }
+                 } catch (parseErr) {
+                      // logger.error({ err: parseErr }, '[Orchestrator] Error parsing endpoint event:');
+                      console.error('[Orchestrator] Error parsing endpoint event:', { err: parseErr });
+                 }
             });
 
-            // Listener for Tools List Response (and maybe others?)
             if (!this.endpointEs) return failSession('Endpoint EventSource is null before onmessage');
-            this.endpointEs.onmessage = (ev: MessageEvent) => {
+            this.endpointEs.onmessage = (ev) => {
+                // Handle async tools/list response specifically
+                // logger.debug('[initializeMcpSession] Received message on endpointEs:', ev.data);
                 console.debug('[initializeMcpSession] Received message on endpointEs:', ev.data);
                 try {
                     const msg = JSON.parse(ev.data);
-                    // Check if it's the tools/list response we are waiting for
-                    if (!receivedToolsList && toolsListReqId !== null && isJsonRpcSuccess(msg) && msg.id === toolsListReqId) {
+                    if (!receivedToolsList && toolsListReqId !== null && this.isJsonRpcSuccess(msg) && msg.id === toolsListReqId) {
+                        // logger.info('[Orchestrator] Received async tools/list response via endpointEs.');
                         console.log('[Orchestrator] Received async tools/list response via endpointEs.');
                         toolsListResult = msg.result?.tools;
                         receivedToolsList = true;
                         checkCompletion();
-                    } else if (!receivedToolsList && toolsListReqId !== null && isJsonRpcError(msg) && msg.id === toolsListReqId) {
-                         console.error('[Orchestrator] Received async tools/list error via endpointEs:', msg.error);
-                         toolsListResult = undefined; // Ensure toolsList is undefined on error
-                         receivedToolsList = true; // Mark as done
-                         checkCompletion();
+                    } else if (!receivedToolsList && toolsListReqId !== null && this.isJsonRpcError(msg) && msg.id === toolsListReqId) {
+                        // logger.error({ err: msg.error }, '[Orchestrator] Received async tools/list error via endpointEs:');
+                        console.error('[Orchestrator] Received async tools/list error via endpointEs:', { err: msg.error });
+                        toolsListResult = undefined; receivedToolsList = true; checkCompletion();
                     }
-                    // TODO: Handle other potential messages on endpointEs if needed
                 } catch (e) {
-                    console.warn('[initializeMcpSession] Failed to parse message on endpointEs:', ev.data, e);
+                     // logger.warn('[initializeMcpSession] Failed to parse message on endpointEs:', ev.data, e);
+                     console.warn('[initializeMcpSession] Failed to parse message on endpointEs:', ev.data, e);
                 }
             };
 
@@ -336,426 +267,372 @@ export class Orchestrator {
         });
     }
 
-    // Ensure the main command/event SSE connection is established.
-    // Creates the client and sends initialize RPC if not already connected.
-    private async _ensureMainSseConnected(): Promise<McpSseClient> {
-        if (this.mcpClient) {
-            return this.mcpClient; // already created
+    // --- JSON-RPC Type Guards (Unchanged) ---
+    private isJsonRpcSuccess(response: any): response is { jsonrpc: '2.0'; id: number | string; result: any } { 
+        // Added return statement to fix linter error
+        return response && response.jsonrpc === '2.0' && response.id !== undefined && response.result !== undefined && response.error === undefined; 
+    }
+    private isJsonRpcError(response: any): response is { jsonrpc: '2.0'; id: number | string | null; error: { code: number; message: string; data?: any } } { 
+        // Added return statement to fix linter error
+        return response && response.jsonrpc === '2.0' && response.id !== undefined && response.error !== undefined;
+    }
+
+
+    /**
+     * Sends a step execution request to the MCP server. Does not wait for completion,
+     * relies on the SSE handler to receive the result and dispatch to FSM.
+     * @param stepIndex The index of the step being executed.
+     * @param step The step object (McpToolCall) to execute.
+     */
+    private async executeStep(stepIndex: number, step: McpToolCall): Promise<void> {
+        if (!this.sessionId || !this.sseUrl) {
+            // logger.error(`[Orchestrator] Cannot execute step ${stepIndex + 1}: Session not initialized.`);
+            console.error(`[Orchestrator] Cannot execute step ${stepIndex + 1}: Session not initialized.`);
+            // Dispatch failure immediately to FSM
+            this.session?.fsm.dispatch(OrchestratorEvent.STEP_FAILED, {
+                stepId: step.tool_call_id ?? `step_${stepIndex}`,
+                error: { code: -32002, message: 'Session not initialized' }
+            });
+            return;
         }
 
-        if (!this.sessionId) {
-            console.error('[Orchestrator] Cannot create SSE client: sessionId missing.');
-            throw new Error('Session ID is missing');
-        }
-
-        // Build SSE URL with sessionId as query param (no trailing /sse here, server expects /sse)
-        this.sseUrl = `${this.mcpServerBaseUrl}/sse?sessionId=${this.sessionId}`;
-
-        // Prepare initialize payload
-        const initPayload = {
+        const requestId = this.rpcIdCounter++; // Use internal counter for request ID
+        // Associate request ID with the step if needed for tracking, but MCP uses its own flow
+        const rpcRequest = {
             jsonrpc: '2.0',
-            id: this.rpcIdCounter++,
-            method: 'initialize',
+            id: requestId,
+            method: 'tools/call',
             params: {
-                protocolVersion: '2024-05-01',
-                clientInfo: {
-                    name: 'll-web-agent-backend',
-                    version: '0.1.0'
-                },
-                capabilities: {
-                    tools: {},
-                    resources: {},
-                    logging: { levels: ['info', 'warn', 'error'] }
-                }
+                name: step.tool_name,
+                arguments: step.arguments
             }
         };
 
-        // Send initialize via POST to SSE endpoint
+        // logger.info(`[Orchestrator] Sending step ${stepIndex + 1} (Request ID: ${requestId}): ${step.tool_name}`, rpcRequest.params);
+        console.log(`[Orchestrator] Sending step ${stepIndex + 1} (Request ID: ${requestId}): ${step.tool_name}`, rpcRequest.params);
+
         try {
-            console.log(`[Orchestrator] Sending initialize RPC to ${this.sseUrl}`);
-            await axios.post(this.sseUrl, initPayload, { headers: { 'Content-Type': 'application/json' }, timeout: 10000 });
+            const response = await axios.post(this.sseUrl, rpcRequest, {
+                headers: { 'Content-Type': 'application/json' },
+                timeout: 15000 // Timeout for the POST acknowledgment only
+            });
+
+            if (response.status >= 200 && response.status < 300) {
+                // logger.info(`[Orchestrator] Step ${stepIndex + 1} (Request ID: ${requestId}) acknowledged by MCP (Status: ${response.status}). Waiting for SSE response.`);
+                console.log(`[Orchestrator] Step ${stepIndex + 1} (Request ID: ${requestId}) acknowledged by MCP (Status: ${response.status}). Waiting for SSE response.`);
+                // Optionally transition FSM to WAIT_MCP_RESPONSE here if desired
+                // this.session?.fsm.dispatch(OrchestratorEvent.EXECUTION_SENT); // Example event
+            } else {
+                // Immediate failure based on POST response
+                // logger.warn(`[Orchestrator] Unexpected acknowledgment status for step ${stepIndex + 1} (Request ID: ${requestId}): ${response.status}. Dispatching STEP_FAILED.`);
+                console.warn(`[Orchestrator] Unexpected acknowledgment status for step ${stepIndex + 1} (Request ID: ${requestId}): ${response.status}. Dispatching STEP_FAILED.`);
+                this.session?.fsm.dispatch(OrchestratorEvent.STEP_FAILED, {
+                    stepId: requestId,
+                    error: { code: -32004, message: `Unexpected MCP acknowledgment: ${response.status}` }
+                });
+            }
         } catch (error: any) {
-            console.error('[Orchestrator] Failed to send initialize RPC:', error.message);
-            throw error;
+            // logger.error({ err: error }, `[Orchestrator] Failed to POST step ${stepIndex + 1} (Request ID: ${requestId}) execution request:`);
+            console.error(`[Orchestrator] Failed to POST step ${stepIndex + 1} (Request ID: ${requestId}) execution request:`, { err: error });
+            this.session?.fsm.dispatch(OrchestratorEvent.STEP_FAILED, {
+                stepId: requestId,
+                error: { code: -32004, message: `Failed to send command: ${error.message}` }
+            });
         }
-
-        // Create SSE client instance once initialization succeeds
-        this.mcpClient = new McpSseClient(this.sseUrl);
-
-        return new Promise((resolve, reject) => {
-            const timeoutId = setTimeout(() => {
-                console.error('[Orchestrator] Timeout waiting for MCP SSE client connection to open.');
-                reject(new Error('Timeout opening SSE connection'));
-            }, 10000); // 10 second timeout for connection opening
-
-            // Ensure mcpClient exists before setting listeners (should always be true here)
-            if (!this.mcpClient) { reject(new Error('Internal error: mcpClient became null before connect')); return; }
-            this.mcpClient!.on('open', () => {
-                clearTimeout(timeoutId);
-                console.log('[Orchestrator] MCP SSE Client Connected.');
-                resolve(this.mcpClient!); // Resolve promise when connection is open
-            });
-
-            this.mcpClient!.on('error', (err: Event) => {
-                clearTimeout(timeoutId);
-                console.error('[Orchestrator] MCP SSE Client Error during connection attempt:', err);
-                reject(err); // Reject promise on error
-            });
-
-            this.mcpClient.on('message', (message: McpMessage) => {
-                if (this.session) {
-                    const event = translateMcpMessageToEvent(message, this.session.fsm.getContext());
-                    
-                    // Check if the message has an extraction function for references
-                    if ((message as any)._extractRefs && typeof (message as any)._extractRefs === 'function') {
-                        console.log('[Orchestrator] Processing message for references extraction');
-                        // Call the extraction function with our processToolResponse method
-                        (message as any)._extractRefs((toolName: string, result: any) => {
-                            this.processToolResponse({ result }, toolName);
-                        });
-                    }
-                    
-                    if (event) {
-                        this.session.fsm.dispatch(event);
-                        this.handleStateChange(this.session.fsm.getCurrentState(), this.session.fsm.getContext());
-                    }
-                }
-            });
-
-            // Same check for close listener
-            this.mcpClient.on('close', () => {
-                console.log('[Orchestrator] MCP SSE Client Closed.');
-                // Just clear the client reference. Don't reset the whole session here.
-                // If a step tries to execute later, it will fail because mcpClient is null.
-                if (this.mcpClient) {
-                    this.mcpClient = null;
-                }
-            });
-
-            // Same check for connect call
-            if (!this.mcpClient) { reject(new Error('Internal error: mcpClient became null before connect')); return; }
-            this.mcpClient.connect();
-        });
     }
 
-    // Method to handle FSM state updates
-    private onStateUpdate(newState: OrchestratorState, context: FsmContext): void {
-        console.log(`[Orchestrator] FSM State Changed: ${newState}, Context:`, context);
-        this.handleStateChange(newState, context);
-    }
+    /**
+     * Handles updates from the FSM, triggering actions like executing steps
+     * or refining arguments based on the new state and context.
+     * @param newState The new state of the FSM.
+     * @param context The context associated with the new state.
+     */
+    async handleFsmUpdate(newState: OrchestratorState, context: Readonly<FsmContext>): Promise<void> {
+        // logger.info(`[Orchestrator] FSM State Updated: ${newState}, Current Step Index: ${context.currentStepIndex}`);
+        console.log(`[Orchestrator] FSM State Updated: ${newState}, Current Step Index: ${context.currentStepIndex}`);
+        // logger.debug('[Orchestrator] FSM Context:', context); // Uncomment for detailed context logging
 
-    // Method to handle actions based on the new state
-    private handleStateChange(newState: OrchestratorState, context: FsmContext): void {
-        // Perform actions based on the *new* state the FSM transitioned *to*
+        // --- Manage Confirmation Timer ---
+        if (newState === OrchestratorState.WAIT_CONFIRM) {
+            this.startConfirmationTimer();
+        } else {
+            // Clear timer if entering any state other than WAIT_CONFIRM
+            this.clearConfirmationTimer();
+        }
+        // --- End Timer Management ---
+
         switch (newState) {
+            case OrchestratorState.IDLE:
+                // logger.info('[Orchestrator] Session is IDLE.');
+                console.log('[Orchestrator] Session is IDLE.');
+                // Reset might have already happened in FSM transition, or do final cleanup here.
+                // Ensure timer is cleared if not already.
+                this.clearConfirmationTimer();
+                break;
+
+            case OrchestratorState.WAIT_CONFIRM:
+                // logger.info(`[Orchestrator] Now waiting for user confirmation for step ${context.currentStepIndex + 1}.`);
+                console.log(`[Orchestrator] Now waiting for user confirmation for step ${context.currentStepIndex + 1}.`);
+                // Log the step details being confirmed
+                if (context.stepToConfirm) {
+                     // logger.info(`[Orchestrator] Step details: ${context.stepToConfirm.tool_name}`, context.stepToConfirm.arguments);
+                     console.log(`[Orchestrator] Step details: ${context.stepToConfirm.tool_name}`, context.stepToConfirm.arguments);
+                } else {
+                     // logger.error('[Orchestrator] FSM entered WAIT_CONFIRM but context.stepToConfirm is null! This indicates a potential logic error.');
+                     console.error('[Orchestrator] FSM entered WAIT_CONFIRM but context.stepToConfirm is null! This indicates a potential logic error.');
+                     // Consider dispatching an error event back to FSM
+                     this.session?.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: 'Internal error: stepToConfirm missing in WAIT_CONFIRM' });
+                }
+                // UI should observe this state via /api/status and display context.stepToConfirm
+                break;
+
             case OrchestratorState.EXECUTE:
-                if (this.session) {
-                     this.executeStep(context.currentStepIndex);
+                // logger.info(`[Orchestrator] FSM requests execution for step ${context.currentStepIndex + 1}.`);
+                console.log(`[Orchestrator] FSM requests execution for step ${context.currentStepIndex + 1}.`);
+                if (this.session && context.currentStepIndex >= 0 && context.currentStepIndex < context.totalSteps) {
+                    const stepToExecute = this.session.steps[context.currentStepIndex];
+                    if (stepToExecute) {
+                        // Call executeStep (fire-and-forget style, wait for SSE)
+                        this.executeStep(context.currentStepIndex, stepToExecute);
+                        // FSM should ideally wait for MCP_RESPONSE_RECEIVED event now.
+                        // Consider adding WAIT_MCP_RESPONSE state if needed for clearer flow.
+                    } else {
+                         // logger.error(`[Orchestrator] Cannot execute step: Step at index ${context.currentStepIndex} not found in session data.`);
+                         console.error(`[Orchestrator] Cannot execute step: Step at index ${context.currentStepIndex} not found in session data.`);
+                         this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: 'Internal error: Step not found for execution' });
+                    }
+                } else {
+                    // logger.error('[Orchestrator] Invalid context for EXECUTE state (missing session, invalid index).');
+                    console.error('[Orchestrator] Invalid context for EXECUTE state (missing session, invalid index).');
+                    this.session?.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: 'Internal error: Invalid context for execution trigger' });
                 }
                 break;
-            case OrchestratorState.IDLE:
-                 // Session ended (success, reject, timeout, cancel, error reset)
-                 console.log('[Orchestrator] Session returning to IDLE state.');
-                 this.resetSession(); // Clean up the session data
+
+             case OrchestratorState.WAIT_MCP_RESPONSE:
+                // This state can be added to FSM if we want explicit waiting period after sending command to MCP
+                // logger.info(`[Orchestrator] Waiting for MCP response/snapshot for step ${context.currentStepIndex + 1}.`);
+                console.log(`[Orchestrator] Waiting for MCP response/snapshot for step ${context.currentStepIndex + 1}.`);
+                // No action needed here; waiting for SSE handler to dispatch MCP_RESPONSE_RECEIVED
+                break;
+
+            case OrchestratorState.WAIT_LLM_RESPONSE:
+                 // logger.info(`[Orchestrator] FSM requests LLM refinement for step ${context.currentStepIndex + 1}.`);
+                 console.log(`[Orchestrator] FSM requests LLM refinement for step ${context.currentStepIndex + 1}.`);
+                 if (this.session &&
+                     context.currentStepIndex >= 0 &&
+                     context.currentStepIndex < context.totalSteps &&
+                     context.latestSnapshot &&
+                     this.session.steps[context.currentStepIndex]) {
+                     const stepToRefine = this.session.steps[context.currentStepIndex];
+                     const snapshot = context.latestSnapshot;
+                     try {
+                         // Construct the 'Call' object for the refinement function
+                         const callToRefine: Call = {
+                            type: 'call',
+                            id: Date.now(), // Use timestamp for ID (number)
+                            method: stepToRefine.tool_name,
+                            params: stepToRefine.arguments
+                         };
+                         // logger.info(`[Orchestrator] Calling refineStepArgumentsWithSnapshot with snapshot (length: ${snapshot.length}) and step:`, callToRefine);
+                         console.log(`[Orchestrator] Calling refineStepArgumentsWithSnapshot with snapshot (length: ${snapshot.length}) and step:`, callToRefine);
+
+                         // Call the refinement function (ensure it exists and works)
+                         const refinedCall = await refineStepArgumentsWithSnapshot(callToRefine, snapshot);
+
+                         // Map the refined Call back to McpToolCall structure
+                         const refinedMcpStep: McpToolCall = {
+                            tool_name: refinedCall.method,
+                            arguments: refinedCall.params as { [key: string]: any; },
+                            tool_call_id: stepToRefine.tool_call_id // Preserve original ID if possible
+                         };
+                         // logger.info(`[Orchestrator] LLM refinement successful. Refined step:`, refinedMcpStep);
+                         console.log(`[Orchestrator] LLM refinement successful. Refined step:`, refinedMcpStep);
+                         // Dispatch success event with the refined step
+                         this.session.fsm.dispatch(OrchestratorEvent.LLM_RESPONSE_RECEIVED, { refinedStep: refinedMcpStep });
+                     } catch (refinementError: any) {
+                         // logger.error({ err: refinementError }, `[Orchestrator] LLM refinement failed for step ${context.currentStepIndex + 1}.`);
+                         console.error(`[Orchestrator] LLM refinement failed for step ${context.currentStepIndex + 1}.`, { err: refinementError });
+                         // Dispatch failure event
+                         this.session.fsm.dispatch(OrchestratorEvent.LLM_RESPONSE_FAILED, { error: refinementError });
+                     }
+                 } else {
+                     // logger.error('[Orchestrator] Invalid context for WAIT_LLM_RESPONSE state (missing session, index, step, or snapshot).');
+                     console.error('[Orchestrator] Invalid context for WAIT_LLM_RESPONSE state (missing session, index, step, or snapshot).');
+                     this.session?.fsm.dispatch(OrchestratorEvent.LLM_RESPONSE_FAILED, { error: 'Internal error: Invalid context for refinement trigger' });
+                 }
                  break;
-             case OrchestratorState.ERROR:
-                 console.error('[Orchestrator] FSM entered ERROR state. Session halted.');
-                 // Optionally attempt to close MCP connection cleanly
-                 // this.mcpClient.disconnect(); 
-                 break;
-             // Other states like REVIEW, WAIT_CONFIRM typically wait for external triggers (API calls)
-             // or internal triggers (parsing complete, MCP responses)
-        }
-        // TODO: Notify UI about state changes via WebSocket
-    }
 
-    // Method to start a new session by parsing an instruction
-    public async startSession(instruction: string): Promise<{ steps: McpToolCall[], initialState: OrchestratorState }> {
-        if (this.session && this.session.fsm.getCurrentState() !== OrchestratorState.IDLE) {
-            console.warn('[Orchestrator] Overwriting existing active session.');
-             // Optionally reject or explicitly handle existing session cleanup
-             this.resetSession();
-        }
-
-        console.log(`[Orchestrator] Starting new session with instruction: "${instruction}"`);
-        const fsm = new OrchestratorFsm(this.onStateUpdate.bind(this)); // Pass bound state update handler
-        this.session = { fsm, steps: [], instruction }; 
-
-        // Ensure MCP session & SSE established upfront for new session
-        // 1. Get session ID (still using endpointEs)
-        const { sessionId, toolsList } = await this.initializeMcpSession();
-        let mcpToolsResp: any[] | undefined = toolsList;
-        let allowedTools: string[] | undefined;
-
-        console.log(`[startSession] Received from initializeMcpSession: sessionId=${sessionId}, toolsList isArray=${Array.isArray(toolsList)}`);
-
-        if (Array.isArray(toolsList)) {
-            allowedTools = toolsList.map(t=>t.name);
-            mcpToolsResp = toolsList;
-             // Build dynamic map: map logical keywords to matching tool names
-             const findTool = (keyword: string) => allowedTools?.find(t => t.toLowerCase().includes(keyword));
-             const mappings: [string,string|undefined][] = [
-                 ['navigate', findTool('navigate')],
-                 ['search', findTool('search')], // Will likely not map if server has no search tool
-                 ['click', findTool('click')],
-                 ['type', findTool('type')],
-                 ['scroll', findTool('scroll')],
-                 ['assert_text', findTool('assert')],
-                 ['dismiss_modal', findTool('dismiss')]
-             ];
-             mappings.forEach(([k,v])=>{ if(v) this.dynamicToolMap[k]=v;});
-             console.log('[Orchestrator] Built dynamicToolMap:', JSON.stringify(this.dynamicToolMap, null, 2));
-        } else {
-            console.warn('[Orchestrator] No valid tools array received after waiting.');
-        }
-
-        console.log(`[startSession] dynamicToolMap after build:`, JSON.stringify(this.dynamicToolMap, null, 2));
-
-        this.session.fsm.dispatch(OrchestratorEvent.RECEIVE_INSTRUCTION);
-        // TODO: Notify UI
-
-        try {
-            const parsedSteps = await parseInstruction(instruction, mcpToolsResp);
-
-            // Check if session was reset during parsing (e.g., by MCP socket error)
-            if (!this.session) {
-                console.warn('[Orchestrator] Session was reset during parsing. Aborting startSession.');
-                // Optionally throw an error or return a specific indicator
-                throw new Error('Session reset during parsing'); 
-            }
-
-            if (parsedSteps && parsedSteps.length > 0) {
-                this.session.steps = parsedSteps;
-                 console.log(`[Orchestrator] Parsing complete, ${parsedSteps.length} steps found.`);
-                this.session.fsm.dispatch(OrchestratorEvent.PARSING_COMPLETE, { steps: parsedSteps });
-                // TODO: Notify UI (though steps are returned directly for now)
-                return { steps: parsedSteps, initialState: this.session.fsm.getCurrentState() };
-            } else {
-                console.warn('[Orchestrator] Parsing failed or returned no steps.');
-                this.session.fsm.dispatch(OrchestratorEvent.PARSING_FAILED);
-                // TODO: Notify UI
+            case OrchestratorState.ERROR:
+                // logger.error(`[Orchestrator] Session entered ERROR state. Last error:`, context.lastError ?? 'Unknown error');
+                console.error(`[Orchestrator] Session entered ERROR state. Last error:`, context.lastError ?? 'Unknown error');
+                // Ensure cleanup happens
                 this.resetSession(OrchestratorState.ERROR);
-                throw new Error('Parsing failed to produce steps.');
-            }
-        } catch (error) {
-            console.error('[Orchestrator] Error during parsing instruction:', error);
-            this.session?.fsm.dispatch(OrchestratorEvent.PARSING_FAILED);
-            this.resetSession(OrchestratorState.ERROR);
-            throw error; // Re-throw
+                break;
+
+            default:
+                // Exhaustive check for unhandled states (good practice with enums)
+                const _exhaustiveCheck: never = newState;
+                // logger.warn(`[Orchestrator] Unhandled FSM state reached: ${_exhaustiveCheck}`);
+                console.warn(`[Orchestrator] Unhandled FSM state reached: ${_exhaustiveCheck}`);
         }
     }
 
-    // Method called when UI confirms a step
-    public confirmStep(stepIdToConfirm: string): void {
-        if (!this.session || this.session.fsm.getCurrentState() !== OrchestratorState.WAIT_CONFIRM) {
-            console.warn('[Orchestrator] Received confirmStep request in invalid state or no session.');
-            return;
+
+    /**
+     * Starts a new session, parses the instruction, and prepares the FSM.
+     * @param instruction The natural language instruction from the user.
+     * @returns A promise that resolves with the initial list of parsed steps.
+     * @throws An error if session initialization or parsing fails.
+     */
+    public async startSession(instruction: string): Promise<{ steps: McpToolCall[] }> {
+        if (this.session) {
+            // logger.warn('[Orchestrator] Session already active. Resetting before starting new one.');
+            console.warn('[Orchestrator] Session already active. Resetting before starting new one.');
+            this.resetSession(); // Reset existing session first
         }
 
-        const currentStep = this.session.steps[this.session.fsm.getContext().currentStepIndex];
+        // logger.info(`[Orchestrator] Starting new session for instruction: "${instruction}"`);
+        console.log(`[Orchestrator] Starting new session for instruction: "${instruction}"`);
 
-        if (!currentStep || currentStep.tool_call_id !== stepIdToConfirm) {
-             console.warn(`[Orchestrator] Confirm request for step ID ${stepIdToConfirm} does not match current step ID ${currentStep?.tool_call_id}.`);
-            // Decide how to handle mismatch - ignore? error?
-            return; 
-        }
-        
-        console.log(`[Orchestrator] Dispatching CONFIRM_STEP for step ${this.session.fsm.getContext().currentStepIndex} (ID: ${stepIdToConfirm})`);
-        this.session.fsm.dispatch(OrchestratorEvent.CONFIRM_STEP);
-        // Handle the state change immediately after dispatch if needed, or rely on onStateUpdate
-         this.handleStateChange(this.session.fsm.getCurrentState(), this.session.fsm.getContext());
-    }
-
-    // Method called when UI rejects/cancels
-    public rejectSteps(): void {
-        if (!this.session || this.session.fsm.getCurrentState() !== OrchestratorState.WAIT_CONFIRM) {
-             console.warn('[Orchestrator] Received rejectSteps request in invalid state or no session.');
-            // Allow rejection from other states maybe? Or only WAIT_CONFIRM?
-             // If allowing from anywhere, use CANCEL_SESSION event?
-            return;
-        }
-        console.log('[Orchestrator] Dispatching REJECT_STEP.');
-        this.session.fsm.dispatch(OrchestratorEvent.REJECT_STEP);
-         this.handleStateChange(this.session.fsm.getCurrentState(), this.session.fsm.getContext());
-    }
-    
-    // Method to handle manual stop/cancel from UI
-    public cancelSession(): void {
-        if (!this.session) {
-            console.log('[Orchestrator] Received cancelSession request but no active session.');
-            return;
-        }
-         console.log('[Orchestrator] Dispatching CANCEL_SESSION.');
-         this.session.fsm.dispatch(OrchestratorEvent.CANCEL_SESSION);
-         this.handleStateChange(this.session.fsm.getCurrentState(), this.session.fsm.getContext());
-    }
-
-    // Executes the step via MCP Socket
-    // Update to make async and use HTTP POST
-    private async executeStep(stepIndex: number): Promise<void> { 
-        // 1. Ensure sessionId exists
-        if (!this.sessionId) {
-             console.error('[executeStep] Error: sessionId is missing.');
-             this.session?.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: { code: -32004, message: 'Session ID lost' } });
-             return;
-        }
-
-        // 2. Ensure the main SSE connection is established (lazy initialization)
         try {
-            this.mcpClient = await this._ensureMainSseConnected();
-        } catch (err) {
-            console.error('[executeStep] Failed to establish main SSE connection:', err);
-             this.session?.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: { code: -32005, message: 'Failed to connect to MCP server' } });
-             return;
-        }
+            // 1. Initialize connection with MCP to get session ID and tools list
+            const { sessionId, toolsList } = await this.initializeMcpSession();
+            // logger.info(`[Orchestrator] MCP Session initialized. Session ID: ${sessionId}`);
+            console.log(`[Orchestrator] MCP Session initialized. Session ID: ${sessionId}`);
 
-        // 3. Proceed with execution if connection is good
-        console.log(`[executeStep] Session state OK: sessionId=${this.sessionId}, mcpClient exists=${!!this.mcpClient}`);
-
-        const currentSessionId = this.sessionId;
-        if (!this.session || stepIndex < 0 || stepIndex >= this.session.steps.length) {
-            console.error(`[Orchestrator] Invalid stepIndex ${stepIndex} for execution.`);
-            // Ensure session exists before dispatching
-            if(this.session) { 
-                this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED); 
+            if (!toolsList || toolsList.length === 0) {
+                 // logger.error('[Orchestrator] Failed to retrieve tools list from MCP.');
+                 console.error('[Orchestrator] Failed to retrieve tools list from MCP.');
+                 throw new Error('Failed to retrieve tools list from MCP.');
             }
-            return;
-        }
 
-        const stepToExecute = this.session.steps[stepIndex];
-        
-        // Use the tool_name directly without mapping
-        const mcpToolName = stepToExecute.tool_name;
-        
-        const currentCallId = this.rpcIdCounter++;
-        console.log(`[Orchestrator] Executing Step ${stepIndex + 1}/${this.session.steps.length} (Ref ID: ${currentCallId}):`, stepToExecute);
-
-        // --- Format as JSON-RPC 2.0 Request --- 
-        const jsonRpcPayload = {
-            jsonrpc: "2.0",
-            id: currentCallId,
-            method: "tools/call",
-            params: {
-                name: mcpToolName,
-                arguments: stepToExecute.arguments
-            }
-        };
-
-        // Construct command URL with session ID
-        const commandUrl = this.sseUrl ?? `${this.mcpServerBaseUrl}/sse?sessionId=${currentSessionId}`;
-
-        // Log the message being sent
-        console.log(`[Orchestrator] Sending JSON-RPC call via POST to ${commandUrl}:`, JSON.stringify(jsonRpcPayload, null, 2));
-        
-        // --- Send via HTTP POST --- 
-        try {
-            // Complete arguments with cached references if needed
-            const completedArguments = this.completeArgumentsWithRefs(mcpToolName, stepToExecute.arguments);
-            
-            // If arguments were modified, update them in the step
-            if (JSON.stringify(completedArguments) !== JSON.stringify(stepToExecute.arguments)) {
-                console.log('[Orchestrator] Updated arguments with cached references:', completedArguments);
-                stepToExecute.arguments = completedArguments;
-            }
-            
-            // Update the payload with potentially modified arguments
-            jsonRpcPayload.params.arguments = stepToExecute.arguments;
-            
-            // Post to the /command URL with the JSON-RPC payload
-            const response = await axios.post<any>( 
-                commandUrl, // Use command URL with session ID
-                jsonRpcPayload,
-                { 
-                    headers: { 'Content-Type': 'application/json' },
-                    timeout: 30000 
+            // 2. Create and setup the FSM instance with the update handler
+            const fsm = new OrchestratorFsm((newState, context) => {
+                // Use a bound method to handle async updates and catch errors
+                this.handleFsmUpdate(newState, context).catch(err => {
+                    // logger.error({ err }, "[Orchestrator] CRITICAL Error in async handleFsmUpdate execution:");
+                    console.error("[Orchestrator] CRITICAL Error in async handleFsmUpdate execution:", { err });
+                    // Ensure session reset happens even if handleFsmUpdate fails
+                    this.resetSession(OrchestratorState.ERROR);
                 });
+            });
 
-            const responseData = response.data;
-            console.log(`[Orchestrator] Received HTTP response for Call ID ${currentCallId}:`, responseData);
+            // 3. Initialize session data object
+            this.session = {
+                fsm,
+                steps: [], // Steps populated after parsing
+                instruction,
+                latestSnapshot: null, // Initialize snapshot
+            };
 
-            // Check if session still exists 
-            if (!this.session) { 
-                console.warn(`[Orchestrator] Session ended while awaiting response for Call ID ${currentCallId}. Ignoring response.`);
-                return;
-            }
-            
-            // Process response to extract references if it's a snapshot
-            this.processToolResponse(responseData, mcpToolName);
-            
-            // If server returns 202 or plain "Accepted", treat as synchronous success (server won't send RESULT)
-            if (response.status === 202 || (typeof responseData === 'string' && responseData.toLowerCase().includes('accepted'))) {
-                console.log(`[Orchestrator] Call ID ${currentCallId} acknowledged by MCP server.`);
-                // Treat as synchronous success (server won't send RESULT)
-                const isLastStepAck = this.session.fsm.getContext().currentStepIndex >= this.session.fsm.getContext().totalSteps - 1;
-                const ackEvent = isLastStepAck ? OrchestratorEvent.STEP_SUCCESS_LAST : OrchestratorEvent.STEP_SUCCESS_NEXT;
-                this.session.fsm.dispatch(ackEvent);
-            } else if (responseData && typeof responseData === 'object' && responseData.id === currentCallId) {
-                if ('result' in responseData) {
-                    console.log(`[Orchestrator] Step ${stepIndex + 1} completed synchronously.`);
-                    const isLastStep = this.session.fsm.getContext().currentStepIndex >= this.session.fsm.getContext().totalSteps - 1;
-                    const successEvent = isLastStep ? OrchestratorEvent.STEP_SUCCESS_LAST : OrchestratorEvent.STEP_SUCCESS_NEXT;
-                    this.session.fsm.dispatch(successEvent, { result: responseData.result });
-                } else if ('error' in responseData) {
-                    console.error(`[Orchestrator] Step ${stepIndex + 1} failed synchronously. JSON-RPC Error:`, responseData.error);
-                    this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: responseData.error });
-                } else {
-                    console.error(`[Orchestrator] Unexpected JSON-RPC response structure for Call ID ${currentCallId}:`, responseData);
-                    this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: { code: -32001, message: 'Unexpected JSON-RPC response structure' } });
-                }
-            } else {
-                console.error(`[Orchestrator] Invalid or mismatched response for Call ID ${currentCallId}:`, responseData);
-                // Do not treat as fatal; wait for SSE result.
-            }
-            
+            // 4. Parse the instruction using the fetched tools
+            // logger.info('[Orchestrator] Parsing instruction...');
+            console.log('[Orchestrator] Parsing instruction...');
+            // Ensure parser does NOT add initial snapshot anymore
+            const parsedSteps = await parseInstruction(instruction, toolsList);
+            // logger.info(`[Orchestrator] Instruction parsed into ${parsedSteps.length} steps.`);
+            console.log(`[Orchestrator] Instruction parsed into ${parsedSteps.length} steps.`);
+            // logger.debug('[Orchestrator] Parsed Steps:', JSON.stringify(parsedSteps, null, 2)); // Verbose
+
+            // 5. Update session steps and dispatch PARSING_COMPLETE to FSM
+            // Ensure steps have unique IDs if parser doesn't provide them
+            this.session.steps = parsedSteps.map((step, index) => ({
+                 ...step,
+                 tool_call_id: step.tool_call_id || `step_${index}_${Date.now()}` // Assign unique ID
+            }));
+
+            // Dispatch event to FSM to kick off the process
+            fsm.dispatch(OrchestratorEvent.PARSING_COMPLETE, { steps: this.session.steps });
+
+            // 6. Return the initial parsed steps to the caller (server.ts)
+            // Note: Filtering snapshot steps happens in server.ts before sending to UI
+            return { steps: this.session.steps };
 
         } catch (error: any) {
-            console.error(`[Orchestrator] HTTP Error executing Step ${stepIndex + 1} (Call ID: ${currentCallId}) via ${commandUrl}:`, error.message);
-             // Check if session still exists
-            if (!this.session) { 
-                console.warn(`[Orchestrator] Session ended before HTTP error could be processed for Call ID ${currentCallId}.`);
-                return;
-            }
-            // Map axios error or other errors to an FSM event
-            let mcpErrorCode = -32000; // Default server error
-            let mcpErrorMessage = 'HTTP request failed';
-            if (axios.isAxiosError(error)) {
-                mcpErrorMessage = error.response?.data?.error?.message || error.message;
-                mcpErrorCode = error.response?.data?.error?.code || (error.code === 'ECONNABORTED' ? -32003 : -32000); // Map timeout
-            } else if (error instanceof Error) {
-                mcpErrorMessage = error.message;
-            }
-            // Dispatch failure with error payload
-            this.session.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: { code: mcpErrorCode, message: mcpErrorMessage } });
+            // logger.error({ err: error }, '[Orchestrator] Failed to start session or parse instruction.');
+            console.error('[Orchestrator] Failed to start session or parse instruction.', { err: error });
+            this.resetSession(OrchestratorState.ERROR); // Ensure reset on any failure during startup
+            throw new Error(`Session initialization failed: ${error.message}`); // Re-throw for server.ts
         }
     }
 
-    // Resets the session state
-    private resetSession(finalState: OrchestratorState = OrchestratorState.IDLE): void {
-        console.log(`[Orchestrator] Resetting session. Final state: ${finalState}`);
-         if (this.session) {
-             // Clear timers managed by FSM if necessary (depends on FSM implementation)
-             this.session.fsm.clearConfirmationTimer?.(); // Add this method to FSM if needed
-         }
-        this.session = null;
-        if (this.mcpClient) {
-            this.mcpClient.disconnect();
-            this.mcpClient = null;
-        }
-        this.sessionId = null;
-        this.sseUrl = null;
-        // TODO: Notify UI that session ended/reset
+     // --- Timer Management ---
+    private startConfirmationTimer() {
+        this.clearConfirmationTimer(); // Clear existing timer first
+        // logger.info(`[Orchestrator] Starting confirmation timer (${Orchestrator.CONFIRMATION_TIMEOUT_MS}ms).`);
+        console.log(`[Orchestrator] Starting confirmation timer (${Orchestrator.CONFIRMATION_TIMEOUT_MS}ms).`);
+        this.confirmationTimerId = setTimeout(() => {
+            // logger.warn('[Orchestrator] Confirmation timer expired. Cancelling session.');
+            console.warn('[Orchestrator] Confirmation timer expired. Cancelling session.');
+            this.confirmationTimerId = null; // Clear the ID before dispatching
+            // Dispatch CANCEL_SESSION to FSM when timer expires
+            this.session?.fsm.dispatch(OrchestratorEvent.CANCEL_SESSION, { reason: 'Confirmation timeout' });
+        }, Orchestrator.CONFIRMATION_TIMEOUT_MS);
     }
 
-    // Public method to get current state (e.g., for status endpoint)
-    public getStatus(): { state: OrchestratorState | string; currentStep: number; totalSteps: number } {
+    private clearConfirmationTimer() {
+        if (this.confirmationTimerId) {
+            // logger.info('[Orchestrator] Clearing confirmation timer.');
+            console.log('[Orchestrator] Clearing confirmation timer.');
+            clearTimeout(this.confirmationTimerId);
+            this.confirmationTimerId = null;
+        }
+    }
+
+    // --- Public Methods for Server Interaction (Interfaces remain the same) ---
+
+    /** Handles user confirmation by dispatching CONFIRM_STEP to the FSM. */
+    public handleConfirmStep(): void {
         if (!this.session) {
-            return { state: OrchestratorState.IDLE, currentStep: 0, totalSteps: 0 };
+            // logger.warn('[Orchestrator] Cannot confirm step: No active session.');
+            console.warn('[Orchestrator] Cannot confirm step: No active session.');
+            throw new Error('No active session to confirm.'); // Let server handle error response
         }
-        const context = this.session.fsm.getContext();
-        return {
-            state: this.session.fsm.getCurrentState(),
-            currentStep: context.currentStepIndex,
-            totalSteps: context.totalSteps,
-        };
+        // logger.info('[Orchestrator] Dispatching CONFIRM_STEP to FSM.');
+        console.log('[Orchestrator] Dispatching CONFIRM_STEP to FSM.');
+        this.session.fsm.dispatch(OrchestratorEvent.CONFIRM_STEP);
     }
-} 
+
+    /** Handles user rejection by dispatching REJECT_STEP to the FSM. */
+    public handleRejectStep(): void {
+        if (!this.session) {
+            // logger.warn('[Orchestrator] Cannot reject step: No active session.');
+            console.warn('[Orchestrator] Cannot reject step: No active session.');
+            return; // Or throw error if needed
+        }
+        // logger.info('[Orchestrator] Dispatching REJECT_STEP to FSM.');
+        console.log('[Orchestrator] Dispatching REJECT_STEP to FSM.');
+        this.session.fsm.dispatch(OrchestratorEvent.REJECT_STEP);
+    }
+
+    /** Handles user cancellation by dispatching CANCEL_SESSION to the FSM. */
+    public handleCancelSession(): void {
+        if (!this.session) {
+            // logger.warn('[Orchestrator] Cannot cancel session: No active session.');
+            console.warn('[Orchestrator] Cannot cancel session: No active session.');
+            return; // Or throw error if needed
+        }
+        // logger.info('[Orchestrator] Dispatching CANCEL_SESSION to FSM.');
+        console.log('[Orchestrator] Dispatching CANCEL_SESSION to FSM.');
+        this.session.fsm.dispatch(OrchestratorEvent.CANCEL_SESSION);
+    }
+
+    /** Returns the current status (state and context) for the UI. */
+    public getStatus(): { state: OrchestratorState; context: Readonly<FsmContext> } {
+        if (!this.session || !this.session.fsm) {
+            // Return default IDLE state if no session
+             const idleContext: FsmContext = {
+                retryCount: 0, currentStepIndex: -1, totalSteps: 0,
+                steps: [], latestSnapshot: null, stepToConfirm: null, lastError: null
+            };
+            return { state: OrchestratorState.IDLE, context: idleContext };
+        }
+        // Return current state and context from the active FSM
+        return { state: this.session.fsm.getCurrentState(), context: this.session.fsm.getContext() };
+    }
+
+    // --- Getters (If needed) ---
+    public get currentSessionId(): string | null {
+        return this.sessionId;
+    }
+}

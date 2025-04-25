@@ -1,4 +1,6 @@
-import Anthropic from '@anthropic-ai/sdk';
+// backend/src/parser/parseInstruction.ts
+// import Anthropic from '@anthropic-ai/sdk';
+import { anthropic, testAnthropicApiKey } from '../llm/anthropicClient'; // Import shared client
 
 // Define the structure for an MCP tool call based on spec.md
 // We might need to refine this based on actual Playwright-MCP requirements
@@ -29,32 +31,13 @@ if (openaiApiKey) {
     console.log('[parseInstruction] OPENAI_API_KEY format:', maskedOpenAiKey);
 }
 
-// Initialize Anthropic client
-const anthropic = new Anthropic({
-    apiKey: process.env.ANTHROPIC_API_KEY, // Use the Anthropic API key from environment
-});
+// // Initialize Anthropic client - MOVED TO anthropicClient.ts
+// const anthropic = new Anthropic({
+//     apiKey: process.env.ANTHROPIC_API_KEY, // Use the Anthropic API key from environment
+// });
 
-// Function to test if the API key is valid
-async function testAnthropicApiKey(): Promise<boolean> {
-    try {
-        console.log('[parseInstruction] Testing Anthropic API key validity...');
-        await anthropic.messages.create({
-            model: 'claude-3-opus-20240229',
-            max_tokens: 10,
-            messages: [{ role: 'user', content: 'Hello' }]
-        });
-        console.log('[parseInstruction] Anthropic API key is valid!');
-        return true;
-    } catch (error: any) {
-        console.error('[parseInstruction] Error testing Anthropic API key:', error.message || error);
-        if (error.status === 401) {
-            console.error('[parseInstruction] API key is invalid or unauthorized');
-        } else if (error.status === 404) {
-            console.error('[parseInstruction] Model not found - check model name');
-        }
-        return false;
-    }
-}
+// // Function to test if the API key is valid - MOVED TO anthropicClient.ts
+// async function testAnthropicApiKey(): Promise<boolean> { ... }
 
 /**
  * Parses a natural language instruction into a sequence of MCP tool calls
@@ -68,7 +51,7 @@ export async function parseInstruction(
     instruction: string,
     mcpTools?: { name: string; description?: string; inputSchema: any }[]
 ): Promise<McpToolCall[]> {
-    // Test API key validity first
+    // Test API key validity first (using imported function)
     const isApiKeyValid = await testAnthropicApiKey();
     if (!isApiKeyValid) {
         console.error('[parseInstruction] Cannot proceed with invalid Anthropic API key');
@@ -136,6 +119,7 @@ CRITICAL RULES:
 Please convert this into a series of individual tool calls, making sure to create a separate tool call for each distinct action.`
                         }
                     ],
+                    // @ts-expect-error - Linter incorrectly flags 'tools' despite it being correct per SDK usage for tool calling
                     tools: tools,
                     tool_choice: { type: "any" }
                 });
@@ -215,27 +199,6 @@ Please convert this into a series of individual tool calls, making sure to creat
         if (finalCalls.length > 10) {
             console.warn(`Parser generated ${finalCalls.length} steps, truncating to 10.`);
             finalCalls = finalCalls.slice(0, 10);
-        }
-
-        // Add a browser_snapshot call at the beginning if it's not already there
-        const hasSnapshot = finalCalls.some((call: McpToolCall) => call.tool_name === 'browser_snapshot');
-        if (!hasSnapshot && finalCalls.length > 0) {
-            console.log('[parseInstruction] Adding initial browser_snapshot call for reference extraction');
-            
-            // Create snapshot tool call
-            const snapshotCall: McpToolCall = {
-                tool_name: 'browser_snapshot',
-                tool_call_id: `snapshot_${Date.now()}`,
-                arguments: {}
-            };
-            
-            // Add it at the beginning
-            finalCalls = [snapshotCall, ...finalCalls];
-            
-            // Make sure we're still within the 10 step limit
-            if (finalCalls.length > 10) {
-                finalCalls = finalCalls.slice(0, 10);
-            }
         }
 
         console.log('[parseInstruction] Successfully parsed calls:', JSON.stringify(finalCalls, null, 2));
