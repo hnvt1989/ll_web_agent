@@ -95,7 +95,7 @@ A web automation tool that lets users describe tasks in plain English and execut
    ```
 
 7. **Access the application**
-   Open your browser to http://localhost:3000
+   Open your browser to http://localhost:5173
 
 ### Using Docker Compose
 
