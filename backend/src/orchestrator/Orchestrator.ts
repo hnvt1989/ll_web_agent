@@ -447,26 +447,12 @@ export class Orchestrator {
         }
 
         const stepToExecute = this.session.steps[stepIndex];
-        // Translate tool name if mapping exists
-        const mcpToolName = this.dynamicToolMap[stepToExecute.tool_name];
-
-        if (!mcpToolName) {
-            console.error(`[Orchestrator] Error: Logical tool '${stepToExecute.tool_name}' has no mapping to an existing MCP tool. Available map:`, this.dynamicToolMap);
-            this.session?.fsm.dispatch(OrchestratorEvent.STEP_FAILED, { error: { code: -32601, message: `Tool '${stepToExecute.tool_name}' not supported by MCP server` } });
-            return;
-        }
-
+        
+        // Use the tool_name directly without mapping
+        const mcpToolName = stepToExecute.tool_name;
+        
         const currentCallId = this.rpcIdCounter++;
         console.log(`[Orchestrator] Executing Step ${stepIndex + 1}/${this.session.steps.length} (Ref ID: ${currentCallId}):`, stepToExecute);
-
-        /* // Standard MCP Format - commented out
-        const callMessage: McpMessage = {
-            type: 'call',
-            id: currentCallId, 
-            method: stepToExecute.tool_name,
-            params: stepToExecute.arguments,
-        };
-        */
 
         // --- Format as JSON-RPC 2.0 Request --- 
         const jsonRpcPayload = {
@@ -478,16 +464,6 @@ export class Orchestrator {
                 arguments: stepToExecute.arguments
             }
         };
-
-        /* // Alternative {action: ...} format - commented out 
-        const altPayload = {
-            action: stepToExecute.tool_name, 
-            ...stepToExecute.arguments 
-        };
-        const commandUrl = this.mcpServerBaseUrl.endsWith('/') 
-                         ? `${this.mcpServerBaseUrl}command` 
-                         : `${this.mcpServerBaseUrl}/command`;
-        */
 
         // Construct command URL with session ID
         const commandUrl = this.sseUrl ?? `${this.mcpServerBaseUrl}/sse?sessionId=${currentSessionId}`;

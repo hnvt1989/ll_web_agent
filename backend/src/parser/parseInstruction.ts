@@ -4,7 +4,7 @@ import { Stream } from 'openai/streaming';
 // Define the structure for an MCP tool call based on spec.md
 // We might need to refine this based on actual Playwright-MCP requirements
 interface McpToolCall {
-    tool_name: 'navigate' | 'search' | 'click' | 'type' | 'scroll' | 'assert_text' | 'dismiss_modal';
+    tool_name: string; // Use string, actual names come from mcpTools
     arguments: { [key: string]: any };
     tool_call_id?: string; // Added for potential OpenAI response mapping
 }
@@ -27,114 +27,42 @@ export async function parseInstruction(
     instruction: string,
     mcpTools?: { name: string; description?: string; inputSchema: any }[]
 ): Promise<McpToolCall[]> {
-    let baseTools: OpenAI.Chat.Completions.ChatCompletionTool[] = mcpTools && mcpTools.length > 0 ?
+
+    // Derive tools ONLY from the provided mcpTools list
+    const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = (mcpTools && mcpTools.length > 0) ?
         mcpTools.map(t => ({
             type: 'function',
             function: {
                 name: t.name,
-                description: t.description || '',
-                parameters: t.inputSchema ? { ...t.inputSchema } : { type: 'object', properties: {} }
+                description: t.description || `Execute the ${t.name} tool.`, // Add a default description if missing
+                parameters: t.inputSchema ? { ...t.inputSchema } : { type: 'object', properties: {} } // Use provided schema or empty object
             }
-        })) : [
-        {
-            type: 'function',
-            function: {
-                name: 'navigate',
-                description: 'Navigate the browser to a specific URL.',
-                parameters: {
-                    type: 'object',
-                    properties: {
-                        url: { type: 'string', description: 'The absolute or relative URL to navigate to.' },
-                    },
-                    required: ['url'],
-                },
-            },
-        },
-        {
-            type: 'function',
-            function: {
-                name: 'click',
-                description: 'Click on an element identified by a CSS selector or reference.',
-                parameters: {
-                    type: 'object',
-                    properties: {
-                        ref: { type: 'string', description: 'The exact target element reference from the page snapshot.' },
-                        element: { type: 'string', description: 'Human-readable element description used to obtain permission.'}
-                    },
-                    required: ['ref', 'element'],
-                },
-            },
-        },
-        {
-             type: 'function',
-             function: {
-                name: 'type',
-                description: 'Type text into an input field identified by reference.',
-                parameters: {
-                    type: 'object',
-                    properties: {
-                         ref: { type: 'string', description: 'Exact target element reference from the page snapshot.' },
-                         element: { type: 'string', description: 'Human-readable element description.'},
-                        text: { type: 'string', description: 'The text to type.' },
-                         submit: { type: 'boolean', description: 'Whether to press Enter after typing. Default false.', default: false },
-                    },
-                     required: ['ref', 'element', 'text'],
-                },
-            },
-        },
-         {
-             type: 'function',
-             function: {
-                name: 'scroll',
-                description: 'Scroll the page up, down, left, or right by a specified amount or to an edge. (Note: May not directly map to a standard Playwright MCP tool)',
-                parameters: {
-                    type: 'object',
-                    properties: {
-                        direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: 'Direction to scroll.' },
-                        offset: { type: 'string', description: 'Pixel amount (e.g., "100px") or percentage (e.g., "50%") or "edge".' },
-                    },
-                    required: ['direction', 'offset'],
-                },
-            },
-        },
-        {
-            type: 'function',
-            function: {
-                name: 'assert_text',
-                description: 'Verify that an element contains specific text. (Note: May not directly map to a standard Playwright MCP tool)',
-                parameters: {
-                    type: 'object',
-                    properties: {
-                         selector: { type: 'string', description: 'CSS selector for the element.' },
-                         text: { type: 'string', description: 'The exact text to assert.' },
-                    },
-                    required: ['selector', 'text'],
-                },
-            },
-        },
-        {
-             type: 'function',
-             function: {
-                name: 'dismiss_modal',
-                description: 'Attempt to automatically dismiss any detected modal dialog or pop-up by accepting or dismissing it.',
-                 parameters: {
-                    type: 'object',
-                     properties: {
-                         accept: { type: 'boolean', description: 'Whether to accept the dialog. Defaults to true (dismiss).' }
-                    },
-                 },
-             },
-         },
-    ];
+        })) : []; // If no mcpTools provided, send an empty tools list
 
-    // Use the derived/fallback tools directly
-    const tools = baseTools;
+    // If no tools are available from the MCP server, we cannot fulfill the request.
+    if (tools.length === 0) {
+        console.warn('[parseInstruction] No MCP tools provided or available. Cannot parse instruction.');
+        // Optionally, could return a specific error message or indicator to the orchestrator/UI
+        return [];
+    }
+
+    // Keep track of the names of the tools actually sent to the API
+    const allowedToolNames = new Set(tools.map(t => t.function.name));
 
     try {
+        console.log(`[parseInstruction] Calling OpenAI with instruction: "${instruction}" and tools:`, JSON.stringify(Array.from(allowedToolNames)));
+
         const stream: Stream<OpenAI.Chat.Completions.ChatCompletionChunk> = await openai.chat.completions.create({
             model: 'gpt-4-turbo',
             messages: [
-                { role: 'system', content: `You are a web automation assistant. Convert the user\'s instruction into a sequence of tool calls using ONLY the provided tools. Generate a maximum of 10 steps. Use the exact tool names provided in the list. If a user request cannot be fulfilled with the available tools (e.g., asking to 'search' when no search tool exists), indicate that you cannot perform the action instead of hallucinating a tool call.` },
+                { 
+                    role: 'system',
+                    content: `You are a web automation assistant. Convert the user's instruction into a sequence of tool calls using ONLY the provided tools. 
+                    - Generate a maximum of 10 steps.
+                    - Use the exact tool names provided in the list.
+                    - Decompose complex actions: For example, a "search" instruction should be broken down into a 'browser_screen_type' call (for the query) potentially followed by a 'browser_screen_click' call (if a search button needs clicking) or setting the 'submit' argument to true in 'browser_screen_type'.
+                    - If a user request cannot be fulfilled with the available tools (e.g., asking to 'download a file' when no download tool exists), indicate that you cannot perform the action by returning an empty list of tool calls.` 
+                },
                 { role: 'user', content: instruction },
             ],
             tools: tools,
@@ -184,17 +112,20 @@ export async function parseInstruction(
                          return null;
                     }
 
-                    const args = JSON.parse(argsString);
-                    if (name as McpToolCall['tool_name'] in tools) {
-                        return {
-                            tool_call_id: id,
-                            tool_name: name as McpToolCall['tool_name'],
-                            arguments: args,
-                        };
-                    } else {
-                         console.warn(`Unknown tool name received: ${name} for Index ${index} (ID ${id})`);
-                         return null;
+                    // Validate that the returned tool name was one we actually sent to the API
+                    if (!allowedToolNames.has(name)) {
+                        console.warn(`LLM returned a tool name ("${name}") that was not in the allowed list for Index ${index} (ID ${id}). Skipping.`);
+                        return null;
                     }
+
+                    const args = JSON.parse(argsString);
+                    // No need for the 'in tools' check anymore, we validated against allowedToolNames
+                    return {
+                        tool_call_id: id,
+                        tool_name: name, // Use the validated name directly
+                        arguments: args,
+                    };
+
                 } catch (error) {
                     console.error(`Failed to parse arguments for tool call at Index ${index} (ID ${id}, Name ${name}): ${argsString}`, error);
                     return null;
@@ -202,6 +133,8 @@ export async function parseInstruction(
             })
             .filter((call): call is McpToolCall => call !== null);
 
+        // REMOVED Fallback Logic Section
+        /*
         let finalCalls = parsedToolCalls;
 
         // Heuristic: if fewer than 2 calls, try fallback split parser for multi-clause instructions
@@ -222,6 +155,10 @@ export async function parseInstruction(
                 console.error('Fallback parser import/use failed:', e);
             }
         }
+        */
+       
+        // Use the result directly from OpenAI parsing
+        let finalCalls = parsedToolCalls;
 
         if (finalCalls.length > 10) {
             console.warn(`Parser generated ${finalCalls.length} steps, truncating to 10.`);

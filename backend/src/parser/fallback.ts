@@ -66,7 +66,8 @@ export function fallbackParser(instruction: string): McpToolCall[] {
         }
     }
 
-    // 4. "search for <query>"
+    // 4. "search for <query>" - REMOVED as it generates non-MCP tool
+    /*
     match = instruction.match(/^search for ["']?([^"']+)["']?$/i);
     if (match && match[1]) {
         const query = match[1].trim();
@@ -78,6 +79,7 @@ export function fallbackParser(instruction: string): McpToolCall[] {
             }];
         }
     }
+    */
 
     // If no pattern matches, return empty array
     return [];
