@@ -33,6 +33,24 @@ function isMcpErrorPayload(payload: any): payload is McpErrorPayload {
     return payload && payload.type === 'ERROR' && typeof payload.tool_call_id === 'string' && typeof payload.code === 'string';
 }
 
+// Add JSON-RPC interfaces
+interface JsonRpcSuccess {
+    id: number;
+    result: any;
+}
+interface JsonRpcError {
+    id: number;
+    error: { code: number; message: string; data?: any };
+}
+
+export function isJsonRpcSuccess(msg: any): msg is JsonRpcSuccess {
+    // Ensure msg is an object before checking for properties
+    return typeof msg === 'object' && msg !== null && 'result' in msg && typeof msg.id === 'number';
+}
+export function isJsonRpcError(msg: any): msg is JsonRpcError {
+    // Ensure msg is an object before checking for properties
+    return typeof msg === 'object' && msg !== null && 'error' in msg && typeof msg.id === 'number';
+}
 
 // --- Event Handlers ---
 
@@ -86,21 +104,46 @@ export function handleMcpError(payload: McpErrorPayload, context: Readonly<FsmCo
      }
 }
 
+// Interface defining the callback structure for handling tools/list response
+interface PendingToolsListInfo {
+    id: number | null;
+    resolve: ((tools: any[] | undefined) => void) | null;
+    reject: ((reason?: any) => void) | null;
+}
 
 /**
  * Generic handler that checks the payload type and calls the appropriate specific handler.
  *
  * @param mcpPayload The raw payload received from the MCP WebSocket.
  * @param context The current FSM context.
- * @returns The translated OrchestratorEvent or null if the payload is not recognized.
+ * @returns The translated OrchestratorEvent or null (if message consumed by tools/list handler).
  */
-export function translateMcpMessageToEvent(mcpPayload: unknown, context: Readonly<FsmContext>): OrchestratorEvent | null {
-     if (isMcpResultPayload(mcpPayload)) {
-         return handleMcpResult(mcpPayload, context);
-     } else if (isMcpErrorPayload(mcpPayload)) {
-         return handleMcpError(mcpPayload, context);
-     } else {
+export function translateMcpMessageToEvent(
+    mcpPayload: unknown,
+    context: Readonly<FsmContext>
+): OrchestratorEvent | null {
+
+    console.debug('[translateMcpMessageToEvent] Received raw SSE message:', JSON.stringify(mcpPayload));
+
+    // Determine if last step based on context
+    const isLastStep = context.currentStepIndex >= context.totalSteps - 1;
+
+    if (isJsonRpcSuccess(mcpPayload)) {
+        console.log(`Handling success for call ID: ${mcpPayload.id}`);
+        return isLastStep ? OrchestratorEvent.STEP_SUCCESS_LAST : OrchestratorEvent.STEP_SUCCESS_NEXT;
+    } else if (isJsonRpcError(mcpPayload)) {
+        console.log(`Handling error for call ID: ${mcpPayload.id}`, mcpPayload.error);
+        return OrchestratorEvent.STEP_FAILED; // FSM handles retry logic / transition to ERROR
+    } else if (isMcpResultPayload(mcpPayload)) {
+        // Handle legacy RESULT type if needed
+        console.log(`Handling legacy RESULT for tool_call_id: ${mcpPayload.tool_call_id}`);
+        return isLastStep ? OrchestratorEvent.STEP_SUCCESS_LAST : OrchestratorEvent.STEP_SUCCESS_NEXT;
+    } else if (isMcpErrorPayload(mcpPayload)) {
+        // Handle legacy ERROR type if needed
+         console.log(`Handling legacy ERROR: code=${mcpPayload.code}, message=${mcpPayload.message}, tool_call_id=${mcpPayload.tool_call_id}`);
+        return OrchestratorEvent.STEP_FAILED;
+    } else {
         console.warn("Received unknown or malformed message from MCP:", mcpPayload);
         return null; // Ignore unknown message types
-     }
+    }
 } 

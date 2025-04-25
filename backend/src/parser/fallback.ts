@@ -13,7 +13,11 @@ interface McpToolCall {
  * @returns An array containing a single McpToolCall if a simple command is detected, otherwise an empty array.
  */
 export function fallbackParser(instruction: string): McpToolCall[] {
-    instruction = instruction.trim().toLowerCase();
+    // Normalize fancy quotes and whitespace
+    instruction = instruction
+        .replace(/[""'']/g, '"')
+        .trim()
+        .toLowerCase();
     let match: RegExpMatchArray | null;
 
     // 1. "go to <url>"
@@ -25,6 +29,7 @@ export function fallbackParser(instruction: string): McpToolCall[] {
             url = 'http://' + url;
         }
         return [{
+            tool_call_id: `fallback_${Date.now()}_${Math.random().toString(36).slice(2)}`,
             tool_name: 'navigate',
             arguments: { url: url }
         }];
@@ -39,6 +44,7 @@ export function fallbackParser(instruction: string): McpToolCall[] {
         const selector = match[2].trim();
         if (selector) {
              return [{
+                tool_call_id: `fallback_${Date.now()}_${Math.random().toString(36).slice(2)}`,
                 tool_name: 'click',
                 arguments: { selector: selector } // Simple passthrough
             }];
@@ -53,8 +59,22 @@ export function fallbackParser(instruction: string): McpToolCall[] {
         const selector = match[2].trim();
         if (textToType && selector) {
             return [{
+                tool_call_id: `fallback_${Date.now()}_${Math.random().toString(36).slice(2)}`,
                 tool_name: 'type',
                 arguments: { selector: selector, text: textToType }
+            }];
+        }
+    }
+
+    // 4. "search for <query>"
+    match = instruction.match(/^search for ["']?([^"']+)["']?$/i);
+    if (match && match[1]) {
+        const query = match[1].trim();
+        if (query) {
+            return [{
+                tool_call_id: `fallback_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+                tool_name: 'search',
+                arguments: { query }
             }];
         }
     }

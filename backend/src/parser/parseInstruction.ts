@@ -20,10 +20,22 @@ const openai = new OpenAI({
  * using OpenAI's function calling feature with streaming.
  *
  * @param instruction The natural language instruction from the user.
+ * @param mcpTools An optional array of MCP tools to use instead of the default tools.
  * @returns A promise that resolves to a list of MCP tool calls.
  */
-export async function parseInstruction(instruction: string): Promise<McpToolCall[]> {
-    const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
+export async function parseInstruction(
+    instruction: string,
+    mcpTools?: { name: string; description?: string; inputSchema: any }[]
+): Promise<McpToolCall[]> {
+    let baseTools: OpenAI.Chat.Completions.ChatCompletionTool[] = mcpTools && mcpTools.length > 0 ?
+        mcpTools.map(t => ({
+            type: 'function',
+            function: {
+                name: t.name,
+                description: t.description || '',
+                parameters: t.inputSchema ? { ...t.inputSchema } : { type: 'object', properties: {} }
+            }
+        })) : [
         {
             type: 'function',
             function: {
@@ -35,21 +47,6 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
                         url: { type: 'string', description: 'The absolute or relative URL to navigate to.' },
                     },
                     required: ['url'],
-                },
-            },
-        },
-        {
-            type: 'function',
-            function: {
-                name: 'search',
-                description: 'Perform a search on the page using a query and optional selector.',
-                parameters: {
-                    type: 'object',
-                    properties: {
-                        query: { type: 'string', description: 'The search term.' },
-                        selector: { type: 'string', description: 'CSS selector for the search input field. May need refinement based on snapshot `ref`.' },
-                    },
-                    required: ['query'],
                 },
             },
         },
@@ -130,11 +127,14 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
          },
     ];
 
+    // Use the derived/fallback tools directly
+    const tools = baseTools;
+
     try {
         const stream: Stream<OpenAI.Chat.Completions.ChatCompletionChunk> = await openai.chat.completions.create({
             model: 'gpt-4-turbo',
             messages: [
-                { role: 'system', content: 'You are a web automation assistant. Convert the user\'s instruction into a sequence of tool calls based on the available tools (navigate, click, type, search, scroll, assert_text, dismiss_modal). Generate a maximum of 10 steps. Use the exact tool names provided. For click and type actions, provide \'ref\' and \'element\' parameters based on accessibility snapshots when available.' },
+                { role: 'system', content: `You are a web automation assistant. Convert the user\'s instruction into a sequence of tool calls using ONLY the provided tools. Generate a maximum of 10 steps. Use the exact tool names provided in the list. If a user request cannot be fulfilled with the available tools (e.g., asking to 'search' when no search tool exists), indicate that you cannot perform the action instead of hallucinating a tool call.` },
                 { role: 'user', content: instruction },
             ],
             tools: tools,
@@ -172,8 +172,6 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
 
         type PotentialToolCall = McpToolCall | null;
 
-        const validToolNames = tools.map(t => t.function.name) as McpToolCall['tool_name'][];
-
         const parsedToolCalls: McpToolCall[] = Object.values(intermediateChunks)
             .map((callInfo, index): PotentialToolCall => {
                 const id = callInfo.id;
@@ -187,7 +185,7 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
                     }
 
                     const args = JSON.parse(argsString);
-                    if (validToolNames.includes(name as McpToolCall['tool_name'])) {
+                    if (name as McpToolCall['tool_name'] in tools) {
                         return {
                             tool_call_id: id,
                             tool_name: name as McpToolCall['tool_name'],
@@ -204,13 +202,34 @@ export async function parseInstruction(instruction: string): Promise<McpToolCall
             })
             .filter((call): call is McpToolCall => call !== null);
 
-        if (parsedToolCalls.length > 10) {
-            console.warn(`Parser generated ${parsedToolCalls.length} steps, truncating to 10.`);
-            return parsedToolCalls.slice(0, 10);
+        let finalCalls = parsedToolCalls;
+
+        // Heuristic: if fewer than 2 calls, try fallback split parser for multi-clause instructions
+        if (finalCalls.length < 2) {
+            try {
+                const { fallbackParser } = await import('./fallback');
+                const segments = instruction.split(/\b(?:and then|,\s*then|and|then)\b/i).map(s => s.trim()).filter(Boolean);
+                const fallbackCalls: McpToolCall[] = [];
+                for (const seg of segments) {
+                    const calls = fallbackParser(seg);
+                    if (calls.length) fallbackCalls.push(...calls);
+                }
+                if (fallbackCalls.length > finalCalls.length) {
+                    console.log('[parseInstruction] Using fallback multi-segment parser, produced', fallbackCalls.length, 'calls');
+                    finalCalls = fallbackCalls;
+                }
+            } catch (e) {
+                console.error('Fallback parser import/use failed:', e);
+            }
         }
 
-        console.log('[parseInstruction] Successfully parsed calls:', JSON.stringify(parsedToolCalls, null, 2));
-        return parsedToolCalls;
+        if (finalCalls.length > 10) {
+            console.warn(`Parser generated ${finalCalls.length} steps, truncating to 10.`);
+            finalCalls = finalCalls.slice(0, 10);
+        }
+
+        console.log('[parseInstruction] Successfully parsed calls:', JSON.stringify(finalCalls, null, 2));
+        return finalCalls;
 
     } catch (error) {
         console.error("Error during OpenAI API call or streaming:", error);
