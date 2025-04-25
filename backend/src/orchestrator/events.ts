@@ -128,6 +128,27 @@ export function translateMcpMessageToEvent(
     // Determine if last step based on context
     const isLastStep = context.currentStepIndex >= context.totalSteps - 1;
 
+    // Callback for extracting references from event data, will be called externally by Orchestrator
+    const extractRefsFromEvent = (handler?: (toolName: string, result: any) => void) => {
+        if (!handler) return;
+        
+        // Extract from JSON-RPC success
+        if (isJsonRpcSuccess(mcpPayload) && mcpPayload.result) {
+            // The method might be in the result if it's structured that way
+            const toolName = mcpPayload.result?.method || mcpPayload.result?.tool || 'unknown';
+            handler(toolName, mcpPayload.result);
+        }
+        
+        // Extract from legacy result format
+        if (isMcpResultPayload(mcpPayload) && mcpPayload.data) {
+            const toolName = mcpPayload.data?.method || mcpPayload.data?.tool || 'unknown';
+            handler(toolName, mcpPayload.data);
+        }
+    };
+    
+    // Store the extraction function on the message object so it can be used by the orchestrator
+    (mcpPayload as any)._extractRefs = extractRefsFromEvent;
+
     if (isJsonRpcSuccess(mcpPayload)) {
         console.log(`Handling success for call ID: ${mcpPayload.id}`);
         return isLastStep ? OrchestratorEvent.STEP_SUCCESS_LAST : OrchestratorEvent.STEP_SUCCESS_NEXT;

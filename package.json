@@ -15,5 +15,8 @@
   "devDependencies": {
     "@playwright/test": "^1.52.0",
     "@tsconfig/strictest": "^2.0.5"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0"
   }
 }

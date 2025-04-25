@@ -4,23 +4,26 @@ FROM node:18-alpine
 # Set the working directory in the container
 WORKDIR /app
 
+# Add a build argument to force a rebuild (helps avoid cache issues)
+ARG REBUILD_ARG=unknown
+
 # Copy package.json and package-lock.json (if available)
 COPY package.json package-lock.json* ./
 
-# Install dependencies (including dev dependencies needed for tsx/typescript)
-# We switch from 'npm ci' to 'npm install' to allow adding tsx later
-RUN npm install
+# Install dependencies including Anthropic SDK
+RUN npm install && npm install @anthropic-ai/sdk --force
 
 # Copy the rest of the backend application code
 COPY . .
 
-# Install tsx to run TypeScript directly
+# Install tsx to run TypeScript directly if it's not already in the dependencies
 RUN npm install --save-dev tsx
 
-# Expose the port the backend runs on (e.g., 3000)
-# This should match the port your server listens on in server.ts
+# Display installed packages for debugging
+RUN npm list @anthropic-ai/sdk
+
+# Expose the port the backend runs on
 EXPOSE 3000
 
-# Command to run the backend application using tsx (shell form)
-# Assumes your main entry point is src/server.ts
-CMD npx tsx watch src/server.ts # Using watch for development HMR 
+# Command to run the backend application
+CMD npx tsx watch src/server.ts 

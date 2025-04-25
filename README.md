@@ -1,6 +1,6 @@
 # Natural Language Web Automation Tool
 
-A web automation tool that lets users describe tasks in plain English and executes them in a visible browser window. Powered by the Model Context Protocol (MCP) and OpenAI's language models.
+A web automation tool that lets users describe tasks in plain English and executes them in a visible browser window. Powered by the Model Context Protocol (MCP) and large language models from Anthropic or OpenAI.
 
 ## Architecture Overview
 
@@ -29,7 +29,7 @@ A web automation tool that lets users describe tasks in plain English and execut
    - Status indicators and session control buttons
 
 2. **Backend Service** (`/backend`):
-   - **Parser** (`/backend/src/parser`): Converts natural language to a sequence of MCP tool calls using OpenAI
+   - **Parser** (`/backend/src/parser`): Converts natural language to a sequence of MCP tool calls using Anthropic Claude or OpenAI
    - **Orchestrator** (`/backend/src/orchestrator`): Manages the FSM, session state, and execution flow
    - **MCP Client** (`/backend/src/mcp`): Handles communication with the MCP server
 
@@ -53,7 +53,7 @@ A web automation tool that lets users describe tasks in plain English and execut
 
 - Node.js 18 or higher
 - Docker and Docker Compose (for containerized deployment)
-- OpenAI API key (for natural language parsing)
+- API key for either Anthropic Claude or OpenAI (for natural language parsing)
 
 ### Local Development
 
@@ -71,7 +71,10 @@ A web automation tool that lets users describe tasks in plain English and execut
 3. **Configure environment**
    Create a `.env` file in the root directory:
    ```
+   # Choose one of the following API keys based on which LLM you want to use
+   ANTHROPIC_API_KEY=your_anthropic_api_key
    OPENAI_API_KEY=your_openai_api_key
+   
    MCP_SERVER_URL=http://localhost:9000
    MCP_SERVER_SSE_URL=http://localhost:9000/sse
    ```

@@ -21,6 +21,14 @@ interface SessionData {
     fsm: OrchestratorFsm;
     steps: McpToolCall[];
     instruction: string | null;
+    latestSnapshot?: string; // Store the latest snapshot HTML content
+}
+
+// Define a reference entry structure for temporary use
+interface RefEntry {
+    ref: string;
+    element: string;
+    text: string;
 }
 
 export class Orchestrator {
@@ -42,6 +50,164 @@ export class Orchestrator {
         // Or handle lazily before first call in executeStep? For simplicity, let's try lazy init in executeStep for now.
     }
     
+    // Extract references from a snapshot
+    private extractReferencesFromSnapshot(snapshotResult: any): RefEntry[] {
+        console.log('[Orchestrator] Extracting references from snapshot...');
+        const references: RefEntry[] = [];
+        
+        if (!snapshotResult || typeof snapshotResult !== 'object') {
+            console.warn('[Orchestrator] No valid snapshot result to extract references from');
+            return references;
+        }
+
+        // Get the HTML content from the snapshot
+        const htmlContent = snapshotResult.html || snapshotResult.content || '';
+        if (!this.session) {
+            console.warn('[Orchestrator] No active session to store snapshot content');
+            return references;
+        }
+        
+        // Store the latest snapshot in the session
+        this.session.latestSnapshot = htmlContent;
+        
+        if (typeof htmlContent === 'string') {
+            // Log a sample of the content for debugging
+            const contentSample = htmlContent.length > 200 ? 
+                htmlContent.substring(0, 200) + '...' : htmlContent;
+            console.log(`[Orchestrator] Processing snapshot content (sample): ${contentSample}`);
+            
+            // Try multiple regex patterns to extract references
+            this.extractReferencesWithPattern(htmlContent, /["']([^"']+)["']\s*\[ref=([^\]]+)\]/g, references);
+            this.extractReferencesWithPattern(htmlContent, /([^\s"'\[]+)\s*\[ref=([^\]]+)\]/g, references);
+            this.extractReferencesWithPattern(htmlContent, /<[^>]+ref="([^"]+)"[^>]*>([^<]+)</g, references, true);
+            
+            console.log(`[Orchestrator] Extracted ${references.length} references from snapshot`);
+            if (references.length > 0) {
+                console.log('[Orchestrator] References:', references.map(r => 
+                    `ref=${r.ref}, element=${r.element}, text="${r.text}"`).join(' | '));
+            } else {
+                console.warn('[Orchestrator] No references found in snapshot content');
+            }
+        }
+        
+        return references;
+    }
+    
+    // Helper to extract references using a specific regex pattern
+    private extractReferencesWithPattern(
+        content: string, 
+        pattern: RegExp, 
+        references: RefEntry[], 
+        swapGroups: boolean = false
+    ): void {
+        let match;
+        
+        while ((match = pattern.exec(content)) !== null) {
+            const textIdx = swapGroups ? 2 : 1;
+            const refIdx = swapGroups ? 1 : 2;
+            
+            const text = match[textIdx].trim();
+            const ref = match[refIdx].trim();
+            
+            // Try to determine the element type
+            let element = 'element'; // Default
+            if (content.includes(`<button`) && content.includes(text)) {
+                element = 'button';
+            } else if (content.includes(`<a`) && content.includes(text)) {
+                element = 'link';
+            } else if (content.includes(`<input`) && content.includes(text)) {
+                element = 'input';
+            } else if (content.includes(`<li`) && content.includes(text)) {
+                element = 'listitem';
+            }
+            
+            references.push({ ref, element, text });
+            console.log(`[Orchestrator] Extracted reference: ref=${ref}, element=${element}, text="${text}"`);
+        }
+    }
+    
+    // Process tool response to extract references if it's a snapshot
+    private processToolResponse(responseData: any, toolName: string): void {
+        console.log(`[Orchestrator] Processing response for tool: ${toolName}`);
+        
+        if (toolName === 'browser_snapshot' && responseData && responseData.result) {
+            this.extractReferencesFromSnapshot(responseData.result);
+        }
+    }
+    
+    // Complete arguments with references from the latest snapshot
+    private completeArgumentsWithRefs(toolName: string, args: any): any {
+        // Don't modify arguments for snapshot tool
+        if (toolName === 'browser_snapshot' || !this.session || !this.session.latestSnapshot) {
+            return args;
+        }
+        
+        // For click or type operations, try to supply missing ref or element info
+        const updatedArgs = { ...args };
+        
+        // If reference is set to <UNKNOWN>, treat it as missing
+        if (updatedArgs.ref === '<UNKNOWN>') {
+            console.log(`[Orchestrator] Found placeholder <UNKNOWN> ref, will attempt to find a real reference`);
+            delete updatedArgs.ref;
+        }
+        
+        // If element is specified but ref is missing, try to find matching element in the latest snapshot
+        if (!updatedArgs.ref && updatedArgs.element && this.session.latestSnapshot) {
+            console.log(`[Orchestrator] Trying to find ref for element: "${updatedArgs.element}"`);
+            
+            // Extract all references from the latest snapshot
+            const references = this.extractReferencesFromSnapshot({ content: this.session.latestSnapshot });
+            
+            // Get all possible matching entries using flexible matching
+            const matchingEntries = references.filter(entry => {
+                // Direct match on element type
+                if (entry.element === updatedArgs.element) {
+                    console.log(`[Orchestrator] Found direct element type match: ${entry.element}`);
+                    return true;
+                }
+                
+                // Check if entry text contains the element text or vice versa
+                if (entry.text && updatedArgs.element) {
+                    const entryText = entry.text.toLowerCase();
+                    const argText = updatedArgs.element.toLowerCase();
+                    
+                    if (entryText.includes(argText) || argText.includes(entryText)) {
+                        console.log(`[Orchestrator] Found text match: "${entry.text}" contains/is contained in "${updatedArgs.element}"`);
+                        return true;
+                    }
+                    
+                    // Check for word-level matches
+                    const entryWords = entryText.split(/\s+/);
+                    const argWords = argText.split(/\s+/);
+                    
+                    const commonWords = entryWords.filter(word => argWords.includes(word));
+                    if (commonWords.length > 0) {
+                        console.log(`[Orchestrator] Found word-level match: common words ${commonWords.join(', ')}`);
+                        return true;
+                    }
+                }
+                
+                return false;
+            });
+            
+            if (matchingEntries.length > 0) {
+                // Just use the first matching entry for simplicity
+                updatedArgs.ref = matchingEntries[0].ref;
+                console.log(`[Orchestrator] Found ref for element ${updatedArgs.element}: ${updatedArgs.ref}`);
+            } else {
+                console.warn(`[Orchestrator] No matching reference found for element: "${updatedArgs.element}"`);
+            }
+        }
+        
+        // Remove <UNKNOWN> refs if we couldn't find a valid replacement
+        if (updatedArgs.ref === '<UNKNOWN>') {
+            console.log(`[Orchestrator] Removing placeholder <UNKNOWN> ref as no valid reference was found`);
+            delete updatedArgs.ref;
+        }
+        
+        return updatedArgs;
+    }
+
     // Initializes session: gets sessionId via 'endpoint' event AND tools via async tools/list response ON THE SAME endpoint stream.
     private async initializeMcpSession(): Promise<{ sessionId: string; toolsList: any[] | undefined }> {
         if (this.sessionId) {
@@ -239,6 +405,16 @@ export class Orchestrator {
             this.mcpClient.on('message', (message: McpMessage) => {
                 if (this.session) {
                     const event = translateMcpMessageToEvent(message, this.session.fsm.getContext());
+                    
+                    // Check if the message has an extraction function for references
+                    if ((message as any)._extractRefs && typeof (message as any)._extractRefs === 'function') {
+                        console.log('[Orchestrator] Processing message for references extraction');
+                        // Call the extraction function with our processToolResponse method
+                        (message as any)._extractRefs((toolName: string, result: any) => {
+                            this.processToolResponse({ result }, toolName);
+                        });
+                    }
+                    
                     if (event) {
                         this.session.fsm.dispatch(event);
                         this.handleStateChange(this.session.fsm.getCurrentState(), this.session.fsm.getContext());
@@ -473,6 +649,18 @@ export class Orchestrator {
         
         // --- Send via HTTP POST --- 
         try {
+            // Complete arguments with cached references if needed
+            const completedArguments = this.completeArgumentsWithRefs(mcpToolName, stepToExecute.arguments);
+            
+            // If arguments were modified, update them in the step
+            if (JSON.stringify(completedArguments) !== JSON.stringify(stepToExecute.arguments)) {
+                console.log('[Orchestrator] Updated arguments with cached references:', completedArguments);
+                stepToExecute.arguments = completedArguments;
+            }
+            
+            // Update the payload with potentially modified arguments
+            jsonRpcPayload.params.arguments = stepToExecute.arguments;
+            
             // Post to the /command URL with the JSON-RPC payload
             const response = await axios.post<any>( 
                 commandUrl, // Use command URL with session ID
@@ -490,6 +678,9 @@ export class Orchestrator {
                 console.warn(`[Orchestrator] Session ended while awaiting response for Call ID ${currentCallId}. Ignoring response.`);
                 return;
             }
+            
+            // Process response to extract references if it's a snapshot
+            this.processToolResponse(responseData, mcpToolName);
             
             // If server returns 202 or plain "Accepted", treat as synchronous success (server won't send RESULT)
             if (response.status === 202 || (typeof responseData === 'string' && responseData.toLowerCase().includes('accepted'))) {
