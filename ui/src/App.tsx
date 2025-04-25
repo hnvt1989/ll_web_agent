@@ -31,6 +31,9 @@ function App() {
 
   const [buttonsDisabled, setButtonsDisabled] = useState(false);
 
+  // Use the correct type for the timeout in a React environment
+  const [disableTimeout, setDisableTimeout] = useState<ReturnType<typeof setTimeout> | null>(null);
+
   // --- Handlers for Modal --- 
   const handleAcceptStep = async (stepId: string) => {
     console.log(`User accepted step ID: ${stepId}`);
@@ -64,17 +67,34 @@ function App() {
     }
     // --- End send confirmation --- 
 
+    // Set a timeout to re-enable buttons after 30 seconds
+    const timeout = setTimeout(() => {
+      setButtonsDisabled(false); // Re-enable buttons after 30 seconds
+    }, 30000); // 30 seconds
+    setDisableTimeout(timeout);
+
+    // Ensure buttons are disabled immediately after accepting a step
+    setButtonsDisabled(true);
+
     // TODO: Move to next step or finish if last step
     const nextStepIndex = currentStepIndex + 1;
     if (nextStepIndex < steps.length) {
-        setCurrentStepIndex(nextStepIndex);
-        setIsReviewModalOpen(true); // Keep modal open for next step
-        setSessionState('WAIT_CONFIRM'); // Use string state
+      setCurrentStepIndex(nextStepIndex);
+      setIsReviewModalOpen(true);
+      setSessionState('WAIT_CONFIRM');
+      if (disableTimeout) {
+        clearTimeout(disableTimeout);
+        setDisableTimeout(null);
+      }
     } else {
-        // Last step was accepted
-        setIsReviewModalOpen(false);
-        setSessionState('IDLE'); // Use string state
-        setSteps([]); // Clear steps
+      // Last step was accepted
+      setIsReviewModalOpen(false);
+      setSessionState('IDLE');
+      setSteps([]);
+      if (disableTimeout) {
+        clearTimeout(disableTimeout);
+        setDisableTimeout(null);
+      }
     }
   };
 
@@ -202,7 +222,11 @@ function App() {
         const data = await res.json();
         setSessionState(data.state);
         // Enable buttons only when state is WAIT_CONFIRM
-        setButtonsDisabled(data.state !== 'WAIT_CONFIRM');
+        const isWaitConfirm = data.state === 'WAIT_CONFIRM';
+        setButtonsDisabled(!isWaitConfirm);
+        if (isWaitConfirm && data.context?.steps?.length > 0) {
+          setIsReviewModalOpen(true);
+        }
         if (Array.isArray(data.context?.steps)) {
           setSteps(data.context.steps);
           setCurrentStepIndex(data.context.currentStepIndex || 0);

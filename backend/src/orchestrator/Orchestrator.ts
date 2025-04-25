@@ -40,9 +40,15 @@ export class Orchestrator {
     private dynamicToolMap: { [key: string]: string } = {};
     private confirmationTimerId: NodeJS.Timeout | null = null; // Timer ID management
     private static readonly CONFIRMATION_TIMEOUT_MS = 120000; // 2 minutes
+    private pendingSnapshotTimer: NodeJS.Timeout | null = null; // Timer for awaiting snapshot
+    private static readonly SNAPSHOT_TIMEOUT_MS = 20000; // 20 seconds
 
     constructor(mcpServerBaseUrl: string) {
         this.mcpServerBaseUrl = mcpServerBaseUrl;
+        // Ensure env var default
+        if (!('ALWAYS_GET_SNAPSHOT' in process.env)) {
+            process.env.ALWAYS_GET_SNAPSHOT = 'false';
+        }
     }
 
     private resetSession(finalState?: OrchestratorState): void {
@@ -318,10 +324,8 @@ export class Orchestrator {
             });
 
             if (response.status >= 200 && response.status < 300) {
-                // logger.info(`[Orchestrator] Step ${stepIndex + 1} (Request ID: ${requestId}) acknowledged by MCP (Status: ${response.status}). Waiting for SSE response.`);
                 console.log(`[Orchestrator] Step ${stepIndex + 1} (Request ID: ${requestId}) acknowledged by MCP (Status: ${response.status}). Waiting for SSE response.`);
-                // Optionally transition FSM to WAIT_MCP_RESPONSE here if desired
-                // this.session?.fsm.dispatch(OrchestratorEvent.EXECUTION_SENT); // Example event
+                this.setupSnapshotTimer();
             } else {
                 // Immediate failure based on POST response
                 // logger.warn(`[Orchestrator] Unexpected acknowledgment status for step ${stepIndex + 1} (Request ID: ${requestId}): ${response.status}. Dispatching STEP_FAILED.`);
@@ -576,6 +580,40 @@ export class Orchestrator {
             console.log('[Orchestrator] Clearing confirmation timer.');
             clearTimeout(this.confirmationTimerId);
             this.confirmationTimerId = null;
+        }
+    }
+
+    private clearPendingSnapshotTimer() {
+        if (this.pendingSnapshotTimer) {
+            clearTimeout(this.pendingSnapshotTimer);
+            this.pendingSnapshotTimer = null;
+        }
+    }
+
+    private setupSnapshotTimer() {
+        if (process.env.ALWAYS_GET_SNAPSHOT === 'true') {
+            this.clearPendingSnapshotTimer();
+            this.pendingSnapshotTimer = setTimeout(() => {
+                console.log('[Orchestrator] Snapshot timeout reached. Requesting explicit browser_snapshot.');
+                this.requestSnapshot().catch(err => console.error('[Orchestrator] Failed to request snapshot:', err));
+            }, Orchestrator.SNAPSHOT_TIMEOUT_MS);
+        }
+    }
+
+    private async requestSnapshot(): Promise<void> {
+        if (!this.sseUrl) return;
+        const snapshotReqId = this.rpcIdCounter++;
+        const snapshotRequest = {
+            jsonrpc: '2.0',
+            id: snapshotReqId,
+            method: 'tools/call',
+            params: { name: 'browser_snapshot', arguments: {} }
+        };
+        console.log(`[Orchestrator] Sending browser_snapshot request (ID: ${snapshotReqId})`);
+        try {
+            await axios.post(this.sseUrl, snapshotRequest, { headers: { 'Content-Type': 'application/json' }, timeout: 15000 });
+        } catch (err) {
+            console.error('[Orchestrator] Error sending browser_snapshot request:', err);
         }
     }
 

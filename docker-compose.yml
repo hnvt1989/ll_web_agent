@@ -39,6 +39,7 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       # Pass the Anthropic API Key from the .env file
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ALWAYS_GET_SNAPSHOT=${ALWAYS_GET_SNAPSHOT}
       # Add any other necessary backend environment variables here
       # - NODE_ENV=development
     networks:
