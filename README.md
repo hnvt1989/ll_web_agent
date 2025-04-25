@@ -137,4 +137,6 @@ Check out the [demo directory](./demo) for a video demonstration of the tool in 
 
 ## License
 
-[MIT](LICENSE) 
+## Example LLM command:
+
+go to https://coffee-cart.app/ and click item Expresso then click Cart
