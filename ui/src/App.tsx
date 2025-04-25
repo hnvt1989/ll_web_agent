@@ -29,6 +29,8 @@ function App() {
   // Use strings for state representation in the UI
   const [sessionState, setSessionState] = useState<string>('IDLE');
 
+  const [buttonsDisabled, setButtonsDisabled] = useState(false);
+
   // --- Handlers for Modal --- 
   const handleAcceptStep = async (stepId: string) => {
     console.log(`User accepted step ID: ${stepId}`);
@@ -192,6 +194,29 @@ function App() {
       }
   };
 
+  const pollStatus = async () => {
+    try {
+      const statusUrl = `${API_BASE_URL}/api/status`;
+      const res = await fetch(statusUrl);
+      if (res.ok) {
+        const data = await res.json();
+        setSessionState(data.state);
+        // Enable buttons only when state is WAIT_CONFIRM
+        setButtonsDisabled(data.state !== 'WAIT_CONFIRM');
+        if (Array.isArray(data.context?.steps)) {
+          setSteps(data.context.steps);
+          setCurrentStepIndex(data.context.currentStepIndex || 0);
+        }
+      }
+    } catch (e) {
+      console.error('Status polling failed', e);
+    }
+  };
+
+  useEffect(() => {
+    const interval = setInterval(pollStatus, 3000);
+    return () => clearInterval(interval);
+  }, []);
 
   return (
     <div className="flex flex-col items-center justify-center min-h-screen p-4 bg-gray-50">
@@ -244,11 +269,12 @@ function App() {
          {/* Integrate StepReviewModal and StatusHUD, passing state */}
          <StepReviewModal
             isOpen={isReviewModalOpen}
-            onOpenChange={setIsReviewModalOpen} // Basic handler to allow closing via overlay click/esc
+            onOpenChange={setIsReviewModalOpen}
             steps={steps}
             currentStepIndex={currentStepIndex}
-            onAccept={handleAcceptStep} // Pass the accept handler
-            onReject={handleRejectSteps} // Pass the reject handler
+            onAccept={handleAcceptStep}
+            onReject={handleRejectSteps}
+            buttonsDisabled={buttonsDisabled}
          />
          <StatusHUD sessionState={sessionState} currentStepIndex={currentStepIndex} totalSteps={steps.length} />
       </div>

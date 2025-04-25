@@ -23,6 +23,7 @@ interface StepReviewModalProps {
   currentStepIndex: number; // Index of the step to review
   onAccept: (stepId: string) => void; // Callback with the ID of the accepted step
   onReject: () => void; // Callback if the user rejects/cancels
+  buttonsDisabled?: boolean; // Disable action buttons when waiting for refinement
 }
 
 function StepReviewModal({
@@ -32,6 +33,7 @@ function StepReviewModal({
   currentStepIndex,
   onAccept,
   onReject,
+  buttonsDisabled = false,
 }: StepReviewModalProps) {
 
   // Ensure the current step index is valid
@@ -93,8 +95,8 @@ function StepReviewModal({
           )} */}
         </div>
         <DialogFooter>
-          <Button variant="outline" onClick={handleReject}>Reject / Cancel</Button>
-          <Button onClick={handleAccept}>Accept Step</Button>
+          <Button variant="outline" onClick={handleReject} disabled={buttonsDisabled}>Reject / Cancel</Button>
+          <Button onClick={handleAccept} disabled={buttonsDisabled}>Accept Step</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
